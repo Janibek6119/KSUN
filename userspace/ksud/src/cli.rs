@@ -6,11 +6,12 @@ use android_logger::Config;
 use log::{LevelFilter, info};
 
 use crate::boot_patch::{BootPatchArgs, BootRestoreArgs};
-use crate::{apk_sign, assets, debug, defs, init_event, ksucalls, module, module_config, susfsd, utils};
+use crate::module::regenerate_preinit_rc;
+use crate::{apk_sign, assets, debug, defs, ksu_uapi, init_event, ksucalls, module, module_config, sulog, susfsd, utils};
 
 /// KernelSU Next userspace cli
 #[derive(Parser, Debug)]
-#[command(author, version = defs::VERSION_NAME, about, long_about = None)]
+#[command(author, version = defs::FULL_VERSION, about, long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Commands,
@@ -30,11 +31,36 @@ enum Commands {
     /// Trigger `service` event
     Services,
 
+    /// Run sulog reader daemon. Not for user. Use `ksud debug sulogd` to launch daemon.
+    #[command(hide = true)]
+    Sulogd,
+
     /// Trigger `boot-complete` event
     BootCompleted,
 
     /// Load kernelsu.ko and execute late-load stage scripts
-    LateLoad,
+    LateLoad {
+        /// Pass allow_shell=1 when loading kernelsu.ko
+        #[arg(long)]
+        allow_shell: bool,
+
+        /// Specify kernel KMI version instead of auto-detection
+        #[arg(long)]
+        kmi: Option<String>,
+
+        /// manager package name
+        #[arg(long, default_value_t = String::from("com.rifsxd.ksunext"))]
+        package_name: String,
+    },
+
+    /// Load a kernel module with kallsyms access
+    Insmod {
+        /// kernel module path
+        module: PathBuf,
+        /// module load parameters (e.g. key=val key2=val2)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        params: Vec<String>,
+    },
 
     /// Install KernelSU Next userspace component to system
     Install {
@@ -97,6 +123,12 @@ enum Commands {
         /// Arguments passed to resetprop
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
+    },
+
+    /// Manage initrc injection
+    Initrc {
+        #[command(subcommand)]
+        command: Initrc,
     },
 
     /// Emulate soft reboot (ksud; zygote)
@@ -171,17 +203,17 @@ enum Debug {
         path: PathBuf,
     },
 
-    /// Load a kernel module from disk
-    Insmod {
-        /// kernel module path
-        module: PathBuf,
-    },
-
     /// Process mark management
     Mark {
         #[command(subcommand)]
         command: MarkCommand,
     },
+
+    /// Launch sulogd daemon manually
+    Sulogd,
+
+    /// Get kernel info
+    Info,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -278,6 +310,9 @@ enum Module {
 
     /// manage module configuration
     Config {
+        /// target internal module name (resolved as internal.<name>)
+        #[arg(long)]
+        internal: Option<String>,
         #[command(subcommand)]
         command: ModuleConfigCmd,
     },
@@ -447,6 +482,12 @@ enum SusfsAction {
     Features,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Initrc {
+    /// Regenerate preinit rc file
+    Refresh,
+}
+
 pub fn run() -> Result<()> {
     android_logger::init_once(
         Config::default()
@@ -487,11 +528,16 @@ pub fn run() -> Result<()> {
                 Module::Action { id } => module::run_action(&id),
                 Module::Metamodule => module::is_metamodule_installed(),
                 Module::List => module::list_modules(),
-                Module::Config { command } => {
-                    // Get module ID from environment variable
-                    let module_id = std::env::var("KSU_MODULE").map_err(|_| {
-                        anyhow::anyhow!("This command must be run in the context of a module")
-                    })?;
+                Module::Config { internal, command } => {
+                    let module_id = match internal {
+                        Some(internal_name) => format!("internal.{internal_name}"),
+                        None => std::env::var("KSU_MODULE").map_err(|_| {
+                            anyhow::anyhow!(
+                                "This command must be run in the context of a module or passed --internal <name>"
+                            )
+                        })?,
+                    };
+                    crate::module::validate_module_id(&module_id)?;
 
                     match command {
                         ModuleConfigCmd::Get { key } => {
@@ -582,7 +628,7 @@ pub fn run() -> Result<()> {
             Sepolicy::Apply { file } => crate::sepolicy::apply_file(file),
             Sepolicy::Check { sepolicy } => crate::sepolicy::check_rule(&sepolicy),
         },
-        Commands::LateLoad => crate::late_load::run(),
+        Commands::LateLoad { package_name, kmi, allow_shell } => crate::late_load::run(&package_name, kmi, allow_shell),
         Commands::Services => {
             if ksucalls::get_version() <= 0 {
                 info!("KernelSU Next not available, exiting services");
@@ -591,6 +637,7 @@ pub fn run() -> Result<()> {
             init_event::on_services();
             Ok(())
         }
+        Commands::Sulogd => sulog::run_sulogd(),
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => crate::profile::get_sepolicy(package),
             Profile::SetSepolicy { package, policy } => {
@@ -637,13 +684,28 @@ pub fn run() -> Result<()> {
                 let data = assets::get_asset_data(&name)?;
                 utils::ensure_binary(&path, &data, false)
             }
-            Debug::Insmod { module } => debug::insmod(&module),
             Debug::Mark { command } => match command {
                 MarkCommand::Get { pid } => debug::mark_get(pid),
                 MarkCommand::Mark { pid } => debug::mark_set(pid),
                 MarkCommand::Unmark { pid } => debug::mark_unset(pid),
                 MarkCommand::Refresh => debug::mark_refresh(),
             },
+            Debug::Sulogd => sulog::ensure_sulogd_running(),
+            Debug::Info => {
+                let info = ksucalls::get_info();
+                println!("version: {}", info.version);
+                println!("flags: 0x{:x}", info.flags);
+                println!("uapi_version: {}", info.uapi_version);
+                println!("features: 0x{:x}", info.features);
+                println!("lkm: {}", ksucalls::is_lkm());
+                println!("late_load: {}", ksucalls::is_late_load());
+                println!("runtime_mode: {}", ksucalls::runtime_mode());
+                println!(
+                    "pr_build: {}",
+                    (info.flags & ksu_uapi::KSU_GET_INFO_FLAG_PR_BUILD) != 0
+                );
+                Ok(())
+            }
         },
 
         Commands::BootPatch(boot_patch) => crate::boot_patch::patch(boot_patch),
@@ -696,6 +758,8 @@ pub fn run() -> Result<()> {
         }
         Commands::SoftReboot => init_event::soft_reboot(),
 
+        Commands::Insmod { module, params } => debug::insmod(&module, &params),
+
         Commands::Susfs { command } => match command {
             SusfsAction::Support => susfsd::show_features(true),
             SusfsAction::Version => susfsd::show_version(),
@@ -714,6 +778,9 @@ pub fn run() -> Result<()> {
                 ksucalls::report_module_mounted();
                 Ok(())
             }
+        },
+        Commands::Initrc { command } => match command {
+            Initrc::Refresh => regenerate_preinit_rc(),
         },
     };
 

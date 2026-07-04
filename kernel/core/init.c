@@ -27,6 +27,7 @@
 #include "selinux/selinux.h"
 #include "feature/adb_root.h"
 #include "feature/selinux_hide.h"
+#include "feature/sulog.h"
 #include "infra/symbol_resolver.h"
 
 #if defined(__x86_64__)
@@ -84,6 +85,9 @@ bool allow_shell = false;
 #endif
 module_param(allow_shell, bool, 0);
 
+bool ksu_no_custom_rc = false;
+module_param_named(norc, ksu_no_custom_rc, bool, 0);
+
 int __init kernelsu_init(void)
 {
 #if defined(__x86_64__)
@@ -124,6 +128,7 @@ int __init kernelsu_init(void)
 	ksu_cred = prepare_creds();
 	if (!ksu_cred) {
 		pr_err("prepare cred failed!\n");
+		return -ENOSYS;
 	}
 
 	ksu_init_symbol_resolver();
@@ -132,6 +137,8 @@ int __init kernelsu_init(void)
 #endif
 
 	ksu_feature_init();
+
+	ksu_sulog_init();
 
 	ksu_adb_root_init();
 
@@ -228,11 +235,11 @@ void __exit kernelsu_exit(void)
 
 	ksu_adb_root_exit();
 
+	ksu_sulog_exit();
+
 	ksu_feature_exit();
 
-	if (ksu_cred) {
-		put_cred(ksu_cred);
-	}
+	put_cred(ksu_cred);
 }
 
 #if NEED_OWN_STACKPROTECTOR

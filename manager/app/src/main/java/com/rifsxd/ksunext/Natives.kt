@@ -20,8 +20,8 @@ object Natives {
     // 32310: new get_allow_list ioctl
     // 33070: SET_SEPOLICY ioctl
     // 33075: add set_init_pgrp ioctl
-    // 33110: bump app profile version, migrate selinux domain
-    const val MINIMAL_SUPPORTED_KERNEL = 33110
+    // 33188: add uapi version
+    const val MINIMAL_SUPPORTED_KERNEL = 33188
 
     const val KERNEL_SU_DOMAIN = "u:r:ksu:s0"
 
@@ -161,8 +161,18 @@ object Natives {
         }
     }
 
+    val kernelUAPIVersion: Int
+        external get
+
+    val managerUAPIVersion: Int
+        external get
+
+    fun checkUAPIMismatch(): Boolean {
+        return kernelUAPIVersion != managerUAPIVersion
+    }
+
     fun requireNewKernel(): Boolean {
-        return version != -1 && version < MINIMAL_SUPPORTED_KERNEL
+        return (version != -1 && version < MINIMAL_SUPPORTED_KERNEL) || checkUAPIMismatch()
     }
 
     val KSU_WORK_DIR = "/data/adb/ksu/"
@@ -193,7 +203,17 @@ object Natives {
         val nonRootUseDefault: Boolean = true,
         val umountModules: Boolean = true,
         var rules: String = "", // this field is save in ksud!!
+
+        val flags: Long = FLAG_KSU_NO_NEW_PRIVS,
     ) : Parcelable {
+        @Keep
+        enum class RootProfileFlag(val display: String, val desc: Int) {
+            NO_NEW_PRIVS(
+                "NO_NEW_PRIVS",
+                R.string.profile_flags_desc_no_new_privs
+            )
+        }
+
         enum class Namespace {
             INHERITED,
             GLOBAL,
@@ -202,4 +222,15 @@ object Natives {
 
         constructor() : this("")
     }
+
+    const val FLAG_KSU_NO_NEW_PRIVS = 1L
 }
+
+fun List<Natives.Profile.RootProfileFlag>.toRawFlags(): Long =
+    fold(0L) { acc, flag -> acc.or(1L.shl(flag.ordinal)) }
+
+fun List<Natives.Profile.RootProfileFlag>.toOrdinalList(): List<Int> =
+    map { it.ordinal }
+
+fun Long.toRootProfileFlags(): List<Natives.Profile.RootProfileFlag> =
+    Natives.Profile.RootProfileFlag.entries.filter { 1L.shl(it.ordinal).and(this) != 0L }.toList()
