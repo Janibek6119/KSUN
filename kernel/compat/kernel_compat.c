@@ -100,12 +100,30 @@ __weak long copy_to_user_nofault(void __user *dst, const void *src, size_t size)
 
 __weak long copy_to_kernel_nofault(void *dst, const void *src, size_t size)
 {
-    return probe_kernel_write(dst, src, size);
+    long ret;
+    mm_segment_t old_fs = get_fs();
+
+    set_fs(KERNEL_DS);
+    pagefault_disable();
+    ret = __copy_to_user_inatomic((__force void __user *)dst, src, size);
+    pagefault_enable();
+    set_fs(old_fs);
+
+    return ret ? -EFAULT : 0;
 }
 
 __weak long copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 {
-    return probe_kernel_read(dst, src, size);
+    long ret;
+    mm_segment_t old_fs = get_fs();
+
+    set_fs(KERNEL_DS);
+    pagefault_disable();
+    ret = __copy_from_user_inatomic(dst, (__force const void __user *)src, size);
+    pagefault_enable();
+    set_fs(old_fs);
+
+    return ret ? -EFAULT : 0;
 }
 #endif // < 5.8.0
 

@@ -21,6 +21,12 @@
 #include "linux/highmem.h"
 #endif
 
+#ifndef __p4d_to_phys
+#define KSU_P4D_TO_PHYS(p4d) (p4d_val(p4d) & PHYS_MASK)
+#else
+#define KSU_P4D_TO_PHYS(p4d) __p4d_to_phys(p4d)
+#endif
+
 // https://github.com/fuqiuluo/ovo/blob/f7da411458e87d32438dc14fce5a3313ed0c967e/ovo/mmuhack.c#L21
 
 // Translate a kernel virtual address to a physical address by walking the
@@ -55,7 +61,7 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
 #if defined(p4d_leaf)
     if (p4d_leaf(*p4d)) {
         pr_debug("Address 0x%lx maps to a P4D-level huge page\n", addr);
-        return __p4d_to_phys(*p4d) + ((addr & ~P4D_MASK));
+        return KSU_P4D_TO_PHYS(*p4d) + ((addr & ~P4D_MASK));
     }
 #endif
 

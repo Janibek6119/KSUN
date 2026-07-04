@@ -15,6 +15,7 @@
 #include "uapi/supercall.h"
 #include "supercall/internal.h"
 #include "arch.h"
+#include "compat/kernel_compat.h"
 #include "util.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_identity.h"
