@@ -55,4 +55,25 @@ config KSU_KPROBES_HOOK
 	  Enable KPROBES, KRETPROBES and TRACEPOINT hook for KernelSU core.
 	  This should not be used on kernel below 5.10.
 
+config KSU_KPROBES_SUSFS
+	bool "KernelSU hookless SUSFS"
+	depends on KSU && KSU != m && KSU_KPROBES_HOOK
+	default n
+	help
+	  Enable the hookless SUSFS runtime hosted entirely inside
+	  KernelSU-Next. This keeps SUSFS out of the main kernel tree and
+	  relies on KSU-owned VFS/procfs/syscall runtime hooks instead of
+	  per-version source patching.
+	  Supported on this branch:
+	  - sus_path / add_sus_path
+	  - sus_path_loop / add_sus_path_loop
+	  - open_redirect / add_open_redirect
+	  - sus_mount / hide_sus_mnts_for_non_su_procs
+	  - sus_kstat / add_sus_kstat / update_sus_kstat
+	  - sus_map / add_sus_map
+	  - spoof_cmdline_or_bootconfig
+	    (cmdline only on kernels without proc bootconfig)
+	  - spoof_uname
+	  - avc_log_spoofing
+
 endmenu

@@ -44,6 +44,8 @@ bool is_task_ksu_domain(const struct cred *cred);
 
 bool is_ksu_domain();
 
+bool is_ksu_domain_fast(void);
+
 bool is_zygote(const struct cred *cred);
 
 bool is_init(const struct cred *cred);

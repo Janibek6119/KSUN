@@ -19,6 +19,9 @@
 #include "util.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_identity.h"
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+#include "susfs/susfs.h"
+#endif
 
 #include "sulog/event.h"
 
@@ -113,6 +116,13 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
 		}
 		return 0;
 	}
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+	if (magic2 == KSU_SUSFS_MAGIC) {
+		ksu_susfs_handle_compat(cmd, *arg);
+		return 0;
+	}
+#endif
 
 	// extensions 
 	u64 reply = (u64)*arg;
@@ -271,6 +281,13 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
             pr_warn("install fd add task_work failed\n");
         }
     }
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+    if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_SUSFS_MAGIC) {
+        ksu_susfs_handle_compat(cmd, (void __user *)arg4);
+        return 0;
+    }
+#endif
 
     if (magic2 == CHANGE_MANAGER_UID) {
         /* only root is allowed for this command */

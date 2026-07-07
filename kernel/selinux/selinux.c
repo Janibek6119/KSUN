@@ -217,6 +217,27 @@ bool is_ksu_domain(void)
     return is_task_ksu_domain(current_cred());
 }
 
+bool is_ksu_domain_fast(void)
+{
+    const struct cred *cred = current_cred();
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+    const struct task_security_struct *tsec;
+#else
+    const struct cred_security_struct *tsec;
+#endif
+
+    if (unlikely(!cached_su_sid || !cred)) {
+        return false;
+    }
+
+    tsec = selinux_cred(cred);
+    if (!tsec) {
+        return false;
+    }
+
+    return tsec->sid == cached_su_sid;
+}
+
 bool is_zygote(const struct cred *cred)
 {
     return is_sid_match(cred, cached_zygote_sid, ZYGOTE_CONTEXT);

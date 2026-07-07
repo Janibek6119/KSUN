@@ -29,6 +29,9 @@
 #include "feature/selinux_hide.h"
 #include "feature/sulog.h"
 #include "infra/symbol_resolver.h"
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+#include "susfs/susfs.h"
+#endif
 
 #if defined(__x86_64__)
 #include <asm/cpufeature.h>
@@ -150,6 +153,10 @@ int __init kernelsu_init(void)
 
 	ksu_selinux_hide_init();
 
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+	ksu_susfs_init();
+#endif
+
 	ksu_supercalls_init();
 
 	if (ksu_late_loaded) {
@@ -213,6 +220,10 @@ void __exit kernelsu_exit(void)
 #endif
 
 	ksu_supercalls_exit();
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+	ksu_susfs_exit();
+#endif
 
 	if (!ksu_late_loaded)
 		ksu_ksud_exit();

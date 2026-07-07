@@ -63,6 +63,12 @@ kernelsu-objs += feature/adb_root.o
 
 kernelsu-objs += feature/selinux_hide.o
 
+ifeq ($(CONFIG_KSU_KPROBES_SUSFS),y)
+kernelsu-objs += susfs/core.o
+kernelsu-objs += susfs/kstat.o
+kernelsu-objs += susfs/procfs.o
+endif
+
 ifdef KBUILD_EXTMOD
 ifeq ($(CONFIG_KSU_DISABLE_MANAGER),y)
 ccflags-y += -DCONFIG_KSU_DISABLE_MANAGER=1
@@ -77,6 +83,7 @@ endif
 
 ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
 ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-generic/errno.h
+ccflags-y += -I$(srctree)/fs
 
 ifeq ($(filter /%,$(src)),)
 KSU_KERNEL_DIR := $(srctree)/$(src)
