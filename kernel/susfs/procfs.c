@@ -1119,6 +1119,12 @@ static void ksu_susfs_cmdline_runtime_disable(void)
 
 void ksu_susfs_handle_boot_completed(void)
 {
+	/*
+	 * Some product/vendor paths are not mounted yet during early
+	 * KernelSU init, so retry built-in hide rules once Android has
+	 * finished booting.
+	 */
+	ksu_susfs_apply_default_rules();
 	ksu_susfs_prop_hygiene_attempts = 0;
 	mod_delayed_work(system_wq, &ksu_susfs_prop_hygiene_restore_work,
 			 msecs_to_jiffies(

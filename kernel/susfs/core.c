@@ -1727,7 +1727,7 @@ bool ksu_susfs_handle_compat(unsigned int cmd, void __user *arg)
 	}
 }
 
-static void ksu_susfs_add_default_rules(void)
+void ksu_susfs_apply_default_rules(void)
 {
 	size_t i;
 	int err;
@@ -1756,7 +1756,7 @@ void ksu_susfs_init(void)
 	hash_init(ksu_susfs_parents_ht);
 	hash_init(ksu_susfs_sb_ht);
 	atomic_set(&ksu_susfs_rule_count, 0);
-	ksu_susfs_add_default_rules();
+	ksu_susfs_apply_default_rules();
 	if (ksu_susfs_procfs_init()) {
 		pr_warn("susfs: procfs runtime init returned non-zero\n");
 	}

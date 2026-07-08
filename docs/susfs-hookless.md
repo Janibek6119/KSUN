@@ -252,7 +252,9 @@ inside `KernelSU-Next` only:
 - built-in default hide for `/product/overlay/LineageSDKOverlaySM8350.apk`
   Note: this is seeded during SUSFS init as a safe default, based on the
   runtime-tested DuckDetector case, so it does not rely on userspace rule
-  injection.
+  injection. The rule is retried again from the SUSFS boot-complete callback
+  so late-mounted product overlays still get picked up on devices where the
+  path is not present during early KernelSU init.
 - `add_sus_path`
 - `add_sus_path_loop`
 - `add_open_redirect`
