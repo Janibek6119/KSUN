@@ -249,6 +249,10 @@ The realistic goal is:
 The current `susfs-hookless` branch implements the KSU-hosted hookless layer
 inside `KernelSU-Next` only:
 
+- built-in default hide for `/product/overlay/LineageSDKOverlaySM8350.apk`
+  Note: this is seeded during SUSFS init as a safe default, based on the
+  runtime-tested DuckDetector case, so it does not rely on userspace rule
+  injection.
 - `add_sus_path`
 - `add_sus_path_loop`
 - `add_open_redirect`

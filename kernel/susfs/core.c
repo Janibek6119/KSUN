@@ -36,6 +36,10 @@
 #define KSU_SUSFS_VARIANT "hookless"
 #define KSU_SUSFS_VERSION "v0.1"
 
+static const char *const ksu_susfs_default_hide_paths[] = {
+	"/product/overlay/LineageSDKOverlaySM8350.apk",
+};
+
 enum ksu_susfs_rule_type {
 	KSU_SUSFS_RULE_HIDE = 0,
 	KSU_SUSFS_RULE_REDIRECT = 1,
@@ -1723,12 +1727,36 @@ bool ksu_susfs_handle_compat(unsigned int cmd, void __user *arg)
 	}
 }
 
+static void ksu_susfs_add_default_rules(void)
+{
+	size_t i;
+	int err;
+
+	for (i = 0; i < ARRAY_SIZE(ksu_susfs_default_hide_paths); i++) {
+		err = ksu_susfs_add_rule(ksu_susfs_default_hide_paths[i], NULL,
+					 0, false);
+		if (!err) {
+			pr_info("susfs: default hide rule enabled for %s\n",
+				ksu_susfs_default_hide_paths[i]);
+			continue;
+		}
+
+		if (err == -ENOENT || err == -EEXIST) {
+			continue;
+		}
+
+		pr_warn("susfs: failed to install default hide rule for %s: %d\n",
+			ksu_susfs_default_hide_paths[i], err);
+	}
+}
+
 void ksu_susfs_init(void)
 {
 	hash_init(ksu_susfs_rules_ht);
 	hash_init(ksu_susfs_parents_ht);
 	hash_init(ksu_susfs_sb_ht);
 	atomic_set(&ksu_susfs_rule_count, 0);
+	ksu_susfs_add_default_rules();
 	if (ksu_susfs_procfs_init()) {
 		pr_warn("susfs: procfs runtime init returned non-zero\n");
 	}
