@@ -10,6 +10,9 @@
 #include "runtime/ksud.h"
 #include "manager/manager_observer.h"
 #include "manager/throne_tracker.h"
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+#include "susfs/susfs.h"
+#endif
 
 bool ksu_module_mounted __read_mostly = false;
 bool ksu_boot_completed __read_mostly = false;
@@ -71,4 +74,7 @@ void on_boot_completed(void)
     track_throne(true);
     ksu_selinux_hide_drop_backup_if_unused();
     ksu_avc_spoof_late_init();
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+    ksu_susfs_handle_boot_completed();
+#endif
 }

@@ -1,5 +1,6 @@
 #include <linux/security.h>
 #include <linux/atomic.h>
+#include <linux/mutex.h>
 #include <linux/version.h>
 
 #include "policy/feature.h"
@@ -15,12 +16,15 @@
 
 static u32 su_sid = 0;
 static u32 priv_app_sid = 0;
+static DEFINE_MUTEX(ksu_avc_spoof_lock);
 
 // init as disabled by default
 static atomic_t disable_spoof = ATOMIC_INIT(1);
 
 void ksu_avc_spoof_enable();
 void ksu_avc_spoof_disable();
+static int __ksu_avc_spoof_enable_locked(void);
+static void __ksu_avc_spoof_disable_locked(void);
 
 static bool ksu_avc_spoof_enabled = true;
 static bool boot_completed = false;
@@ -34,21 +38,29 @@ static int avc_spoof_feature_get(u64 *value)
 static int avc_spoof_feature_set(u64 value)
 {
 	bool enable = value != 0;
+	int err = 0;
 
 	if (enable == ksu_avc_spoof_enabled) {
 		pr_info("avc_spoof: no need to change\n");
 		return 0;
 	}
 
-	ksu_avc_spoof_enabled = enable;
-
 	if (boot_completed) {
 		if (enable) {
-			ksu_avc_spoof_enable();
+			mutex_lock(&ksu_avc_spoof_lock);
+			err = __ksu_avc_spoof_enable_locked();
+			mutex_unlock(&ksu_avc_spoof_lock);
 		} else {
-			ksu_avc_spoof_disable();
+			mutex_lock(&ksu_avc_spoof_lock);
+			__ksu_avc_spoof_disable_locked();
+			mutex_unlock(&ksu_avc_spoof_lock);
 		}
 	}
+	if (err) {
+		return err;
+	}
+
+	ksu_avc_spoof_enabled = enable;
 
 	pr_info("avc_spoof: set to %d\n", enable);
 
@@ -101,6 +113,7 @@ int ksu_handle_slow_avc_audit(u32 *tsid)
 #include <linux/slab.h>
 #include "arch.h"
 static struct kprobe *slow_avc_audit_kp;
+static bool slow_avc_audit_hook_installed;
 //	.symbol_name = "slow_avc_audit",
 //	.pre_handler = slow_avc_audit_pre_handler,
 static int slow_avc_audit_pre_handler(struct kprobe *p, struct pt_regs *regs)
@@ -160,32 +173,54 @@ static void destroy_kprobe(struct kprobe **kp_ptr)
 }
 #endif // CONFIG_KPROBES
 
-void ksu_avc_spoof_disable(void)
+static int __ksu_avc_spoof_enable_locked(void)
 {
+	int ret = get_sid();
+
+	if (ret) {
+		pr_info("avc_spoof/init: sid grab fail!\n");
+		return ret;
+	}
+
 #ifdef CONFIG_KPROBES
-	pr_info("avc_spoof/exit: unregister slow_avc_audit kprobe!\n");
-	destroy_kprobe(&slow_avc_audit_kp);
+	if (!slow_avc_audit_hook_installed) {
+		pr_info("avc_spoof/init: register slow_avc_audit kprobe!\n");
+		slow_avc_audit_kp = init_kprobe("slow_avc_audit",
+						slow_avc_audit_pre_handler);
+		if (!slow_avc_audit_kp) {
+			pr_info("avc_spoof/init: slow_avc_audit hook install failed!\n");
+			return -EINVAL;
+		}
+		slow_avc_audit_hook_installed = true;
+	}
 #endif
+	atomic_set(&disable_spoof, 0);
+	pr_info("avc_spoof/init: slow_avc_audit spoofing enabled!\n");
+	return 0;
+}
+
+static void __ksu_avc_spoof_disable_locked(void)
+{
+	/*
+	 * Keep the kprobe installed and only gate the handler off. Tearing the
+	 * hook down live is riskier than leaving the dormant probe in place.
+	 */
 	atomic_set(&disable_spoof, 1);
 	pr_info("avc_spoof/exit: slow_avc_audit spoofing disabled!\n");
 }
 
-void ksu_avc_spoof_enable(void) 
+void ksu_avc_spoof_disable(void)
 {
-	int ret = get_sid();
-	if (ret) {
-		pr_info("avc_spoof/init: sid grab fail!\n");
-		return;
-	}
+	mutex_lock(&ksu_avc_spoof_lock);
+	__ksu_avc_spoof_disable_locked();
+	mutex_unlock(&ksu_avc_spoof_lock);
+}
 
-#ifdef CONFIG_KPROBES
-	pr_info("avc_spoof/init: register slow_avc_audit kprobe!\n");
-	slow_avc_audit_kp = init_kprobe("slow_avc_audit", slow_avc_audit_pre_handler);
-#endif	
-	// once we get the sids, we can now enable the hook handler
-	atomic_set(&disable_spoof, 0);
-	
-	pr_info("avc_spoof/init: slow_avc_audit spoofing enabled!\n");
+void ksu_avc_spoof_enable(void)
+{
+	mutex_lock(&ksu_avc_spoof_lock);
+	(void)__ksu_avc_spoof_enable_locked();
+	mutex_unlock(&ksu_avc_spoof_lock);
 }
 
 void ksu_avc_spoof_late_init(void)
@@ -206,8 +241,17 @@ void __init ksu_avc_spoof_init(void)
 
 void __exit ksu_avc_spoof_exit(void)
 {
+	mutex_lock(&ksu_avc_spoof_lock);
 	if (ksu_avc_spoof_enabled) {
-		ksu_avc_spoof_disable();
+		__ksu_avc_spoof_disable_locked();
 	}
+#ifdef CONFIG_KPROBES
+	if (slow_avc_audit_hook_installed) {
+		pr_info("avc_spoof/exit: unregister slow_avc_audit kprobe!\n");
+		destroy_kprobe(&slow_avc_audit_kp);
+		slow_avc_audit_hook_installed = false;
+	}
+#endif
+	mutex_unlock(&ksu_avc_spoof_lock);
 	ksu_unregister_feature_handler(KSU_FEATURE_AVC_SPOOF);
 }

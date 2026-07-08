@@ -253,24 +253,54 @@ inside `KernelSU-Next` only:
 - `add_sus_path_loop`
 - `add_open_redirect`
 - `hide_sus_mnts_for_non_su_procs`
+  Note: the procfs mount/fdinfo compatibility view is now scoped to the same
+  umounted app/isolation UIDs as the rest of SUSFS. Root and zygote-side
+  readers keep the stock procfs implementation so ReZygisk, TreatWheel, and
+  similar tooling do not parse a rewritten mount view.
+  Mount-namespace identity is normalized separately through a KSU-owned
+  `mntns_get()` kretprobe so `/proc/*/ns/mnt`, `readlink()`, and namespace-fd
+  identity stay aligned with the visible main namespace for SUSFS-hidden app
+  readers.
 - `add_sus_kstat`
 - `update_sus_kstat`
 - `add_sus_kstat_statically`
   Note: standalone `sus_kstat` is implemented with a `vfs_getattr_nosec()`
-  kretprobe plus runtime wrappers for `/proc/*/maps` and `/proc/*/smaps`.
+  kretprobe plus runtime patches on the proc `maps` and `smaps`
+  `seq_operations.show` slots.
+  The patched show handlers only spoof output for the same umounted
+  app/isolation readers SUSFS is targeting; root and zygote-side readers fall
+  back to the kernel's original procfs logic.
 - `add_sus_map`
-  Note: standalone `sus_map` is implemented with KSU-owned runtime wrappers for
-  `/proc/*/maps`, `/proc/*/smaps`, `/proc/*/smaps_rollup`,
-  `/proc/*/pagemap`, `/proc/*/map_files`, and `/proc/*/mem`.
-  `pagemap` is zero-filled for hidden file-backed VMAs so the virtual-page
-  indexing stays stable while the mapped file remains hidden.
+  Note: standalone `sus_map` is implemented with KSU-owned runtime patches on
+  the proc `maps` and `smaps` `seq_operations.show` slots.
+  The broader hookless proc/mm wrappers for `/proc/*/smaps_rollup`,
+  `/proc/*/pagemap`, `map_files`, and `/proc/*/mem` are deliberately kept on
+  the stock kernel path for now, but the original BRENE-triggered
+  `add_sus_map` panic path has been fixed: current live-device replay of the
+  BRENE module's `sus_map` batch no longer reproduces the
+  `scheduling while atomic` crash.
 - `set_cmdline_or_bootconfig`
   Note: this 5.4 target exposes `/proc/cmdline` but does not have
   `/proc/bootconfig`, so the compat command maps to cmdline spoofing only.
+  The hookless implementation now swaps the kernel's `saved_command_line`
+  pointer from inside KernelSU-Next instead of patching the proc entry's
+  `single_show` callback at runtime.
 - `set_uname`
 - `enable_avc_log_spoofing`
 - compat reporting for `show_version`, `show_variant`, and
   `show_enabled_features`
+- delayed property hygiene for BRENE-style resetprop cleanup
+  Note: the kernel-owned KSU init-rc injection now captures a pre-module
+  baseline for
+  `ro.build.version.known_codenames` and
+  `ro.product.ab_ota_partitions`. The matching restore path is no longer
+  embedded in the appended init rc; instead `on_boot_completed()` schedules a
+  kernel-owned usermode helper retry window that deletes `ro.modversion`,
+  restores the tracked coherence props, and rebuilds the property areas after
+  asynchronous module scripts finish.
+  This keeps the flow kernel-side without requiring a manager refresh while
+  avoiding the init-rc parser regressions caused by embedding complex shell
+  parameter expansion directly into the appended rc blob.
 
 The implementation is intentionally scoped to built-in
 `CONFIG_KSU_KPROBES_SUSFS` on top of `CONFIG_KSU_KPROBES_HOOK` and works by:
@@ -281,14 +311,22 @@ The implementation is intentionally scoped to built-in
 - proxying selected superblock operations for synthetic redirected inodes
 - patching procfs file-operation entry points at runtime for mount and fdinfo
   views
-- patching procfs `maps` and `smaps` entry points at runtime for standalone
-  `sus_kstat` dev:ino spoofing
-- patching procfs `smaps_rollup`, `pagemap`, `map_files`, and `mem` entry
-  points at runtime for standalone `sus_map`
+- using a `mntns_get()` kretprobe so mount-namespace symlink, path-follow, and
+  namespace-fd identity all converge on the same visible namespace for
+  SUSFS-hidden app readers
+- patching procfs `maps` and `smaps` `seq_operations.show` slots at runtime
+  for standalone `sus_kstat` dev:ino spoofing and `sus_map` hiding
 - replacing `/proc/cmdline` from inside KSU instead of patching proc source
 - using a KSU syscall hook for `uname` instead of patching `kernel/sys.c`
 - reusing the existing KSU AVC spoof feature instead of duplicating SELinux
   patch logic
+- capturing the BRENE-oriented property baseline from KSU's injected init rc
+  and restoring it from a delayed kernel-owned usermode helper retry window
+  after `boot-completed`, so it stays kernel-side without depending on manager
+  updates
+- deferring SUSFS compat commands onto task work when running through
+  `CONFIG_KSU_KPROBES_HOOK`, so path resolution, mutexes, and user buffer
+  copies do not execute from the reboot kprobe's atomic pre-handler context
 
 For the proc/mm compatibility layer, the current implementation also assumes
 the target kernel exposes the needed procfs symbols through kallsyms. On this
@@ -296,9 +334,23 @@ the target kernel exposes the needed procfs symbols through kallsyms. On this
 already enables `CONFIG_KALLSYMS_ALL=y`.
 
 At this point the old SUSFS feature set from the main kernel patch path is
-covered from inside `KernelSU-Next`, with the remaining complexity concentrated
-in the proc/mm compatibility layer instead of spread across multiple core
-kernel files.
+mostly covered from inside `KernelSU-Next`, with the remaining complexity
+concentrated in the proc/mm compatibility layer instead of spread across
+multiple core kernel files. The one deliberate gap right now is the broader
+`sus_map` proc/mm surface, which is narrowed to `maps` and `smaps` until the
+live-device lockup on LSPosed preload mappings is fully root-caused.
+
+One live-device panic has now been root-caused: under
+`CONFIG_KSU_KPROBES_HOOK`, SUSFS compat commands originally ran directly from
+the `sys_reboot` kprobe pre-handler. Replaying BRENE's `add_sus_map` batch
+triggered `BUG: scheduling while atomic` from `ksu_susfs_handle_sus_map_compat`
+in that atomic context. The current branch fixes that by deferring SUSFS
+compat work to task work before returning to userspace.
+
+For compatibility, the procfs runtime layer is intentionally narrower than the
+old global kernel patch path. The hookless implementation only rewrites procfs
+views for the umounted app/isolation processes SUSFS is targeting, while
+zygote/root readers continue through the stock kernel code path.
 
 One legacy option is intentionally not ported as part of the hookless layer:
 

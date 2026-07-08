@@ -3,10 +3,15 @@
 #include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/init.h>
+#include <linux/init_task.h>
+#include <linux/jiffies.h>
 #include <linux/jump_label.h>
+#include <linux/kmod.h>
 #include <linux/kprobes.h>
+#include <linux/mnt_namespace.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
+#include <linux/nsproxy.h>
 #include <linux/proc_fs.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
@@ -19,6 +24,7 @@
 #include <linux/uaccess.h>
 #include <linux/utsname.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 
 #include <asm/unistd.h>
 
@@ -32,12 +38,19 @@
 #include "infra/symbol_resolver.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
+#include "policy/allowlist.h"
 #include "policy/feature.h"
+#include "runtime/ksud_boot.h"
 #include "selinux/selinux.h"
 #include "susfs/procfs.h"
 #include "susfs/susfs.h"
 
 #define KSU_SUSFS_MOUNT_HASH_BITS 8
+#define KSU_SUSFS_CMDLINE_RETRY_DELAY_MS 1000
+#define KSU_SUSFS_MOUNT_WINDOW_RETRY_DELAY_MS 1000
+#define KSU_SUSFS_PROP_HYGIENE_INITIAL_DELAY_MS 1000
+#define KSU_SUSFS_PROP_HYGIENE_RETRY_DELAY_MS 5000
+#define KSU_SUSFS_PROP_HYGIENE_MAX_ATTEMPTS 6
 
 extern const struct file_operations proc_mounts_operations;
 extern const struct file_operations proc_mountinfo_operations;
@@ -62,11 +75,12 @@ static DEFINE_SPINLOCK(ksu_susfs_hidden_mounts_lock);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_mount_hide_enabled);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_cmdline_spoof_enabled);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_uname_spoof_enabled);
-static DEFINE_SEQLOCK(ksu_susfs_cmdline_lock);
 static DEFINE_SEQLOCK(ksu_susfs_uname_lock);
 
 static char ksu_susfs_fake_cmdline[KSU_SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE];
 static struct ksu_susfs_uname_cmd ksu_susfs_fake_uname;
+static char *ksu_susfs_orig_saved_command_line;
+static char *ksu_susfs_cmdline_shadow;
 
 static int (*ksu_susfs_orig_mounts_open)(struct inode *inode, struct file *file);
 static int (*ksu_susfs_orig_mountinfo_open)(struct inode *inode,
@@ -74,18 +88,119 @@ static int (*ksu_susfs_orig_mountinfo_open)(struct inode *inode,
 static int (*ksu_susfs_orig_mountstats_open)(struct inode *inode,
 					     struct file *file);
 static int (*ksu_susfs_orig_fdinfo_open)(struct inode *inode, struct file *file);
+static int (*ksu_susfs_orig_show_mounts)(struct seq_file *m,
+					 struct vfsmount *mnt);
+static int (*ksu_susfs_orig_show_mountinfo)(struct seq_file *m,
+					    struct vfsmount *mnt);
+static int (*ksu_susfs_orig_show_mountstats)(struct seq_file *m,
+					     struct vfsmount *mnt);
 
 static const struct file_operations *ksu_susfs_fdinfo_fops;
 static struct kretprobe *ksu_susfs_vfs_create_mount_rp;
 static struct kretprobe *ksu_susfs_clone_mnt_rp;
+static struct kretprobe *ksu_susfs_mntns_get_rp;
 static struct kprobe *ksu_susfs_cleanup_mnt_kp;
+static DEFINE_MUTEX(ksu_susfs_cmdline_patch_lock);
 static bool ksu_susfs_cmdline_ready;
 static bool ksu_susfs_mount_runtime_ready;
 static bool ksu_susfs_uname_hook_ready;
+static bool ksu_susfs_mount_window_open;
+static int ksu_susfs_cmdline_last_err;
+static unsigned int ksu_susfs_prop_hygiene_attempts;
+
+static void ksu_susfs_cmdline_retry_fn(struct work_struct *work);
+static void ksu_susfs_mount_window_retry_fn(struct work_struct *work);
+static void ksu_susfs_prop_hygiene_restore_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ksu_susfs_cmdline_retry_work,
+			    ksu_susfs_cmdline_retry_fn);
+static DECLARE_DELAYED_WORK(ksu_susfs_mount_window_retry_work,
+			    ksu_susfs_mount_window_retry_fn);
+static DECLARE_DELAYED_WORK(ksu_susfs_prop_hygiene_restore_work,
+			    ksu_susfs_prop_hygiene_restore_fn);
+
+static char ksu_susfs_prop_hygiene_restore_script[] =
+	"RP=/data/adb/ksu/bin/resetprop; "
+	"BASE=/data/adb/ksu/prop_hygiene_baseline; "
+	"[ -x \"$RP\" ] && [ -f \"$BASE\" ] || exit 1; "
+	"CN=`sed -n '1p' \"$BASE\"`; "
+	"AB=`sed -n '2p' \"$BASE\"`; "
+	"\"$RP\" -d ro.modversion >/dev/null 2>&1; "
+	"if [ -n \"$CN\" ]; then "
+	"\"$RP\" -n ro.build.version.known_codenames \"$CN\" >/dev/null 2>&1; "
+	"else "
+	"\"$RP\" -d ro.build.version.known_codenames >/dev/null 2>&1; "
+	"fi; "
+	"if [ -n \"$AB\" ]; then "
+	"\"$RP\" -n ro.product.ab_ota_partitions \"$AB\" >/dev/null 2>&1; "
+	"else "
+	"\"$RP\" -d ro.product.ab_ota_partitions >/dev/null 2>&1; "
+	"fi; "
+	"\"$RP\" -c --force >/dev/null 2>&1; "
+	"RV=`/system/bin/getprop ro.modversion`; "
+	"[ -z \"$RV\" ]";
+
+static int ksu_susfs_run_prop_hygiene_restore(void)
+{
+	static char *argv[] = {
+		(char *)"/system/bin/sh",
+		(char *)"-c",
+		ksu_susfs_prop_hygiene_restore_script,
+		NULL,
+	};
+	static char *envp[] = {
+		(char *)"HOME=/",
+		(char *)"PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/product/bin",
+		NULL,
+	};
+
+	return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
+static void ksu_susfs_prop_hygiene_restore_fn(struct work_struct *work)
+{
+	int err = ksu_susfs_run_prop_hygiene_restore();
+
+	if (err) {
+		if (ksu_susfs_prop_hygiene_attempts <
+		    KSU_SUSFS_PROP_HYGIENE_MAX_ATTEMPTS) {
+			ksu_susfs_prop_hygiene_attempts++;
+			mod_delayed_work(
+				system_wq, &ksu_susfs_prop_hygiene_restore_work,
+				msecs_to_jiffies(
+					KSU_SUSFS_PROP_HYGIENE_RETRY_DELAY_MS));
+			pr_warn("susfs: prop hygiene restore retry %u/%u (err=%d)\n",
+				ksu_susfs_prop_hygiene_attempts,
+				KSU_SUSFS_PROP_HYGIENE_MAX_ATTEMPTS, err);
+			return;
+		}
+
+		pr_warn("susfs: prop hygiene restore failed after %u attempts: %d\n",
+			ksu_susfs_prop_hygiene_attempts + 1, err);
+		return;
+	}
+
+	pr_info("susfs: prop hygiene restore complete\n");
+}
 
 static bool ksu_susfs_compat_root_allowed(void)
 {
 	return current_uid().val == 0 || is_ksu_domain();
+}
+
+static bool ksu_susfs_mount_view_allowed_current(void)
+{
+	uid_t uid;
+
+	if (unlikely(in_interrupt() || oops_in_progress)) {
+		return false;
+	}
+	if (unlikely(current->flags & (PF_KTHREAD | PF_EXITING))) {
+		return false;
+	}
+
+	uid = current_uid().val;
+	return (is_appuid(uid) || is_isolated_process(uid)) &&
+	       ksu_uid_should_umount(uid);
 }
 
 static bool ksu_susfs_mount_hidden_exact(struct mount *mnt)
@@ -177,7 +292,63 @@ static bool ksu_susfs_mount_hide_view_enabled(void)
 		return false;
 	}
 
-	return !is_ksu_domain();
+	return !is_ksu_domain() && ksu_susfs_mount_view_allowed_current();
+}
+
+static void ksu_susfs_schedule_cmdline_retry(unsigned long delay)
+{
+	if (READ_ONCE(ksu_susfs_cmdline_ready)) {
+		return;
+	}
+
+	mod_delayed_work(system_wq, &ksu_susfs_cmdline_retry_work, delay);
+}
+
+static bool ksu_susfs_sdcard_android_ready(void)
+{
+	struct path path;
+	const struct cred *saved;
+	int err;
+
+	saved = override_creds(ksu_cred);
+	err = kern_path("/sdcard/Android", LOOKUP_FOLLOW, &path);
+	revert_creds(saved);
+	if (err) {
+		return false;
+	}
+
+	path_put(&path);
+	return true;
+}
+
+static bool ksu_susfs_mount_auto_hide_window_open(void)
+{
+	return READ_ONCE(ksu_susfs_mount_window_open) &&
+	       !READ_ONCE(ksu_boot_completed);
+}
+
+static bool ksu_susfs_mount_should_mark_current(void)
+{
+	if (!is_ksu_domain_fast()) {
+		return false;
+	}
+
+	return ksu_susfs_mount_auto_hide_window_open();
+}
+
+static void ksu_susfs_mount_window_retry_fn(struct work_struct *work)
+{
+	if (READ_ONCE(ksu_boot_completed) || ksu_susfs_sdcard_android_ready()) {
+		if (READ_ONCE(ksu_susfs_mount_window_open)) {
+			pr_info("susfs: mount auto-hide window closed\n");
+		}
+		WRITE_ONCE(ksu_susfs_mount_window_open, false);
+		return;
+	}
+
+	schedule_delayed_work(&ksu_susfs_mount_window_retry_work,
+			      msecs_to_jiffies(
+				      KSU_SUSFS_MOUNT_WINDOW_RETRY_DELAY_MS));
 }
 
 static void ksu_susfs_mount_mark_hidden(struct mount *mnt)
@@ -296,244 +467,102 @@ static void ksu_susfs_restore_fop_open(const struct file_operations *fops,
 	*old_open = NULL;
 }
 
-static void ksu_susfs_show_mnt_opts(struct seq_file *m, struct vfsmount *mnt)
+static struct mnt_namespace *ksu_susfs_to_mnt_ns(struct ns_common *ns)
 {
-	static const struct {
-		int flag;
-		const char *str;
-	} mnt_info[] = {
-		{ MNT_NOSUID, ",nosuid" },
-		{ MNT_NODEV, ",nodev" },
-		{ MNT_NOEXEC, ",noexec" },
-		{ MNT_NOATIME, ",noatime" },
-		{ MNT_NODIRATIME, ",nodiratime" },
-		{ MNT_RELATIME, ",relatime" },
-		{ 0, NULL }
-	};
-	const typeof(mnt_info[0]) *info;
-
-	for (info = mnt_info; info->flag; info++) {
-		if (mnt->mnt_flags & info->flag) {
-			seq_puts(m, info->str);
-		}
-	}
-}
-
-static int ksu_susfs_show_sb_opts(struct seq_file *m, struct super_block *sb)
-{
-	static const struct {
-		int flag;
-		const char *str;
-	} fs_info[] = {
-		{ SB_SYNCHRONOUS, ",sync" },
-		{ SB_DIRSYNC, ",dirsync" },
-		{ SB_MANDLOCK, ",mand" },
-		{ SB_LAZYTIME, ",lazytime" },
-		{ 0, NULL }
-	};
-	const typeof(fs_info[0]) *info;
-
-	for (info = fs_info; info->flag; info++) {
-		if (sb->s_flags & info->flag) {
-			seq_puts(m, info->str);
-		}
+	if (!ns) {
+		return NULL;
 	}
 
-	return security_sb_show_options(m, sb);
+	return container_of(ns, struct mnt_namespace, ns);
 }
 
-static inline void ksu_susfs_mangle(struct seq_file *m, const char *s)
+static struct mnt_namespace *ksu_susfs_get_visible_mnt_ns(void)
 {
-	seq_escape(m, s, " \t\n\\");
-}
+	struct mnt_namespace *mnt_ns = NULL;
 
-static void ksu_susfs_show_type(struct seq_file *m, struct super_block *sb)
-{
-	ksu_susfs_mangle(m, sb->s_type->name);
-	if (sb->s_subtype) {
-		seq_putc(m, '.');
-		ksu_susfs_mangle(m, sb->s_subtype);
+	task_lock(&init_task);
+	if (init_task.nsproxy && init_task.nsproxy->mnt_ns) {
+		mnt_ns = init_task.nsproxy->mnt_ns;
+		get_mnt_ns(mnt_ns);
 	}
+	task_unlock(&init_task);
+
+	return mnt_ns;
+}
+
+static int ksu_susfs_mntns_get_handler(struct kretprobe_instance *ri,
+				       struct pt_regs *regs)
+{
+	struct ns_common *orig_ns;
+	struct mnt_namespace *visible_ns;
+
+	if (!ksu_susfs_mount_hide_view_enabled()) {
+		return 0;
+	}
+
+	orig_ns = (struct ns_common *)regs_return_value(regs);
+	if (!orig_ns) {
+		return 0;
+	}
+
+	visible_ns = ksu_susfs_get_visible_mnt_ns();
+	if (!visible_ns) {
+		return 0;
+	}
+
+	if (orig_ns == &visible_ns->ns) {
+		put_mnt_ns(visible_ns);
+		return 0;
+	}
+
+	put_mnt_ns(ksu_susfs_to_mnt_ns(orig_ns));
+	PT_REGS_RC(regs) = (unsigned long)&visible_ns->ns;
+	return 0;
 }
 
 static int ksu_susfs_show_vfsmnt(struct seq_file *m, struct vfsmount *mnt)
 {
-	struct proc_mounts *p = m->private;
 	struct mount *r = real_mount(mnt);
-	struct path mnt_path = {
-		.dentry = mnt->mnt_root,
-		.mnt = mnt,
-	};
-	struct super_block *sb = mnt_path.dentry->d_sb;
-	int err;
 
 	if (ksu_susfs_mount_hidden_or_ancestor(r)) {
 		return 0;
 	}
 
-	if (sb->s_op->show_devname) {
-		err = sb->s_op->show_devname(m, mnt_path.dentry);
-		if (err) {
-			goto out;
-		}
-	} else {
-		ksu_susfs_mangle(m, r->mnt_devname ? r->mnt_devname : "none");
-	}
-	seq_putc(m, ' ');
-
-	err = seq_path_root(m, &mnt_path, &p->root, " \t\n\\");
-	if (err) {
-		goto out;
-	}
-	seq_putc(m, ' ');
-
-	ksu_susfs_show_type(m, sb);
-	seq_puts(m, __mnt_is_readonly(mnt) ? " ro" : " rw");
-
-	err = ksu_susfs_show_sb_opts(m, sb);
-	if (err) {
-		goto out;
+	if (!ksu_susfs_orig_show_mounts) {
+		return -ENOSYS;
 	}
 
-	ksu_susfs_show_mnt_opts(m, mnt);
-	if (sb->s_op->show_options2) {
-		err = sb->s_op->show_options2(mnt, m, mnt_path.dentry);
-	} else if (sb->s_op->show_options) {
-		err = sb->s_op->show_options(m, mnt_path.dentry);
-	}
-	seq_puts(m, " 0 0\n");
-
-out:
-	return err;
+	return ksu_susfs_orig_show_mounts(m, mnt);
 }
 
 static int ksu_susfs_show_mountinfo(struct seq_file *m, struct vfsmount *mnt)
 {
-	struct proc_mounts *p = m->private;
 	struct mount *r = real_mount(mnt);
-	struct super_block *sb = mnt->mnt_sb;
-	struct path mnt_path = {
-		.dentry = mnt->mnt_root,
-		.mnt = mnt,
-	};
-	int err;
 
 	if (ksu_susfs_mount_hidden_or_ancestor(r)) {
 		return 0;
 	}
 
-	seq_printf(m, "%i %i %u:%u ", r->mnt_id, r->mnt_parent->mnt_id,
-		   MAJOR(sb->s_dev), MINOR(sb->s_dev));
-	if (sb->s_op->show_path) {
-		err = sb->s_op->show_path(m, mnt->mnt_root);
-		if (err) {
-			goto out;
-		}
-	} else {
-		seq_dentry(m, mnt->mnt_root, " \t\n\\");
-	}
-	seq_putc(m, ' ');
-
-	err = seq_path_root(m, &mnt_path, &p->root, " \t\n\\");
-	if (err) {
-		goto out;
+	if (!ksu_susfs_orig_show_mountinfo) {
+		return -ENOSYS;
 	}
 
-	seq_puts(m, mnt->mnt_flags & MNT_READONLY ? " ro" : " rw");
-	ksu_susfs_show_mnt_opts(m, mnt);
-
-	if (IS_MNT_SHARED(r)) {
-		seq_printf(m, " shared:%i", r->mnt_group_id);
-	}
-	if (IS_MNT_SLAVE(r)) {
-		int master = r->mnt_master->mnt_group_id;
-		int dom = get_dominating_id(r, &p->root);
-
-		seq_printf(m, " master:%i", master);
-		if (dom && dom != master) {
-			seq_printf(m, " propagate_from:%i", dom);
-		}
-	}
-	if (IS_MNT_UNBINDABLE(r)) {
-		seq_puts(m, " unbindable");
-	}
-
-	seq_puts(m, " - ");
-	ksu_susfs_show_type(m, sb);
-	seq_putc(m, ' ');
-	if (sb->s_op->show_devname) {
-		err = sb->s_op->show_devname(m, mnt->mnt_root);
-		if (err) {
-			goto out;
-		}
-	} else {
-		ksu_susfs_mangle(m, r->mnt_devname ? r->mnt_devname : "none");
-	}
-	seq_puts(m, sb_rdonly(sb) ? " ro" : " rw");
-
-	err = ksu_susfs_show_sb_opts(m, sb);
-	if (err) {
-		goto out;
-	}
-
-	if (sb->s_op->show_options2) {
-		err = sb->s_op->show_options2(mnt, m, mnt->mnt_root);
-	} else if (sb->s_op->show_options) {
-		err = sb->s_op->show_options(m, mnt->mnt_root);
-	}
-	seq_putc(m, '\n');
-
-out:
-	return err;
+	return ksu_susfs_orig_show_mountinfo(m, mnt);
 }
 
 static int ksu_susfs_show_vfsstat(struct seq_file *m, struct vfsmount *mnt)
 {
-	struct proc_mounts *p = m->private;
 	struct mount *r = real_mount(mnt);
-	struct path mnt_path = {
-		.dentry = mnt->mnt_root,
-		.mnt = mnt,
-	};
-	struct super_block *sb = mnt_path.dentry->d_sb;
-	int err;
 
 	if (ksu_susfs_mount_hidden_or_ancestor(r)) {
 		return 0;
 	}
 
-	if (sb->s_op->show_devname) {
-		seq_puts(m, "device ");
-		err = sb->s_op->show_devname(m, mnt_path.dentry);
-		if (err) {
-			goto out;
-		}
-	} else if (r->mnt_devname) {
-		seq_puts(m, "device ");
-		ksu_susfs_mangle(m, r->mnt_devname);
-	} else {
-		seq_puts(m, "no device");
+	if (!ksu_susfs_orig_show_mountstats) {
+		return -ENOSYS;
 	}
 
-	seq_puts(m, " mounted on ");
-	err = seq_path_root(m, &mnt_path, &p->root, " \t\n\\");
-	if (err) {
-		goto out;
-	}
-	seq_putc(m, ' ');
-
-	seq_puts(m, "with fstype ");
-	ksu_susfs_show_type(m, sb);
-
-	if (sb->s_op->show_stats) {
-		seq_putc(m, ' ');
-		err = sb->s_op->show_stats(m, mnt_path.dentry);
-	}
-
-	seq_putc(m, '\n');
-
-out:
-	return err;
+	return ksu_susfs_orig_show_mountstats(m, mnt);
 }
 
 static int ksu_susfs_mounts_open(struct inode *inode, struct file *file)
@@ -557,6 +586,9 @@ static int ksu_susfs_mounts_open(struct inode *inode, struct file *file)
 	}
 
 	p = m->private;
+	if (!ksu_susfs_orig_show_mounts) {
+		ksu_susfs_orig_show_mounts = p->show;
+	}
 	p->show = ksu_susfs_show_vfsmnt;
 	return 0;
 }
@@ -582,6 +614,9 @@ static int ksu_susfs_mountinfo_open(struct inode *inode, struct file *file)
 	}
 
 	p = m->private;
+	if (!ksu_susfs_orig_show_mountinfo) {
+		ksu_susfs_orig_show_mountinfo = p->show;
+	}
 	p->show = ksu_susfs_show_mountinfo;
 	return 0;
 }
@@ -607,6 +642,9 @@ static int ksu_susfs_mountstats_open(struct inode *inode, struct file *file)
 	}
 
 	p = m->private;
+	if (!ksu_susfs_orig_show_mountstats) {
+		ksu_susfs_orig_show_mountstats = p->show;
+	}
 	p->show = ksu_susfs_show_vfsstat;
 	return 0;
 }
@@ -685,10 +723,12 @@ static int ksu_susfs_fdinfo_show(struct seq_file *m, void *v)
 			ret = 0;
 		}
 		spin_unlock(&files->file_lock);
-		put_files_struct(files);
 	}
 
 	if (ret) {
+		if (files) {
+			put_files_struct(files);
+		}
 		return ret;
 	}
 
@@ -715,12 +755,23 @@ out_tail:
 		file->f_op->show_fdinfo(m, file);
 	}
 
+	if (files) {
+		put_files_struct(files);
+	}
 	fput(file);
 	return 0;
 }
 
 static int ksu_susfs_fdinfo_open(struct inode *inode, struct file *file)
 {
+	if (!ksu_susfs_orig_fdinfo_open) {
+		return -ENOSYS;
+	}
+
+	if (!ksu_susfs_mount_hide_view_enabled()) {
+		return ksu_susfs_orig_fdinfo_open(inode, file);
+	}
+
 	return single_open(file, ksu_susfs_fdinfo_show, inode);
 }
 
@@ -730,7 +781,7 @@ static int ksu_susfs_vfs_create_mount_entry(struct kretprobe_instance *ri,
 	struct ksu_susfs_vfs_create_mount_ctx *ctx =
 		(struct ksu_susfs_vfs_create_mount_ctx *)ri->data;
 
-	ctx->hide = is_ksu_domain_fast();
+	ctx->hide = ksu_susfs_mount_should_mark_current();
 	return 0;
 }
 
@@ -761,8 +812,8 @@ static int ksu_susfs_clone_mnt_entry(struct kretprobe_instance *ri,
 		(struct ksu_susfs_clone_mnt_ctx *)ri->data;
 
 	ctx->old = (struct mount *)PT_REGS_PARM1(regs);
-	ctx->hide = is_ksu_domain_fast() ||
-		    ksu_susfs_mount_hidden_or_ancestor(ctx->old);
+	ctx->hide = ksu_susfs_mount_hidden_or_ancestor(ctx->old) ||
+		    ksu_susfs_mount_should_mark_current();
 	return 0;
 }
 
@@ -890,8 +941,14 @@ static void ksu_susfs_mount_runtime_disable(void)
 
 	ksu_susfs_destroy_kretprobe(&ksu_susfs_vfs_create_mount_rp);
 	ksu_susfs_destroy_kretprobe(&ksu_susfs_clone_mnt_rp);
+	ksu_susfs_destroy_kretprobe(&ksu_susfs_mntns_get_rp);
 	ksu_susfs_destroy_kprobe(&ksu_susfs_cleanup_mnt_kp);
+	cancel_delayed_work_sync(&ksu_susfs_mount_window_retry_work);
 	ksu_susfs_mount_clear_hidden_all();
+	ksu_susfs_orig_show_mounts = NULL;
+	ksu_susfs_orig_show_mountinfo = NULL;
+	ksu_susfs_orig_show_mountstats = NULL;
+	WRITE_ONCE(ksu_susfs_mount_window_open, false);
 
 	if (static_key_enabled(&ksu_susfs_mount_hide_enabled)) {
 		static_branch_disable(&ksu_susfs_mount_hide_enabled);
@@ -951,6 +1008,13 @@ static int ksu_susfs_mount_runtime_enable(void)
 		goto err_out;
 	}
 
+	ksu_susfs_mntns_get_rp =
+		ksu_susfs_init_kretprobe("mntns_get", NULL,
+					 ksu_susfs_mntns_get_handler, 0);
+	if (!ksu_susfs_mntns_get_rp) {
+		pr_warn("susfs: mnt namespace identity hook unavailable\n");
+	}
+
 	addr = find_kernel_symbol_exact("proc_fdinfo_file_operations");
 	if (addr) {
 		ksu_susfs_fdinfo_fops =
@@ -964,6 +1028,15 @@ static int ksu_susfs_mount_runtime_enable(void)
 		}
 	}
 
+	WRITE_ONCE(ksu_susfs_mount_window_open,
+		   !READ_ONCE(ksu_boot_completed));
+	if (ksu_susfs_mount_auto_hide_window_open()) {
+		schedule_delayed_work(
+			&ksu_susfs_mount_window_retry_work,
+			msecs_to_jiffies(
+				KSU_SUSFS_MOUNT_WINDOW_RETRY_DELAY_MS));
+	}
+
 	ksu_susfs_mount_runtime_ready = true;
 	return 0;
 
@@ -972,53 +1045,84 @@ err_out:
 	return err;
 }
 
-static int ksu_susfs_cmdline_orig_show(struct seq_file *m, void *v)
+static int __ksu_susfs_cmdline_runtime_enable_locked(void)
 {
-	seq_puts(m, saved_command_line);
-	seq_putc(m, '\n');
-	return 0;
-}
+	if (!READ_ONCE(saved_command_line)) {
+		return -ENOENT;
+	}
 
-static int ksu_susfs_cmdline_show(struct seq_file *m, void *v)
-{
-	unsigned seq;
-	char *cmdline;
-
-	if (static_branch_unlikely(&ksu_susfs_cmdline_spoof_enabled)) {
-		cmdline = kmalloc(sizeof(ksu_susfs_fake_cmdline), GFP_KERNEL);
-		if (!cmdline) {
-			seq_puts(m, ksu_susfs_fake_cmdline);
-			seq_putc(m, '\n');
-			return 0;
+	if (!ksu_susfs_cmdline_shadow) {
+		ksu_susfs_cmdline_shadow =
+			kzalloc(sizeof(ksu_susfs_fake_cmdline), GFP_KERNEL);
+		if (!ksu_susfs_cmdline_shadow) {
+			return -ENOMEM;
 		}
-
-		do {
-			seq = read_seqbegin(&ksu_susfs_cmdline_lock);
-			strscpy(cmdline, ksu_susfs_fake_cmdline,
-				sizeof(ksu_susfs_fake_cmdline));
-		} while (read_seqretry(&ksu_susfs_cmdline_lock, seq));
-		seq_puts(m, cmdline);
-		seq_putc(m, '\n');
-		kfree(cmdline);
-		return 0;
 	}
 
-	return ksu_susfs_cmdline_orig_show(m, v);
+	if (!ksu_susfs_orig_saved_command_line) {
+		ksu_susfs_orig_saved_command_line =
+			READ_ONCE(saved_command_line);
+	}
+
+	if (static_key_enabled(&ksu_susfs_cmdline_spoof_enabled) &&
+	    ksu_susfs_fake_cmdline[0]) {
+		strscpy(ksu_susfs_cmdline_shadow, ksu_susfs_fake_cmdline,
+			sizeof(ksu_susfs_fake_cmdline));
+		WRITE_ONCE(saved_command_line, ksu_susfs_cmdline_shadow);
+	} else {
+		WRITE_ONCE(saved_command_line, ksu_susfs_orig_saved_command_line);
+	}
+
+	ksu_susfs_cmdline_ready = true;
+	return 0;
 }
 
-static int ksu_susfs_cmdline_replace(bool spoofed)
+static int ksu_susfs_cmdline_runtime_enable(void)
 {
-	struct proc_dir_entry *pde;
+	int err;
 
-	remove_proc_entry("cmdline", NULL);
-	pde = proc_create_single("cmdline", 0, NULL,
-				 spoofed ? ksu_susfs_cmdline_show :
-					   ksu_susfs_cmdline_orig_show);
-	if (!pde) {
-		return -ENOMEM;
+	mutex_lock(&ksu_susfs_cmdline_patch_lock);
+	err = __ksu_susfs_cmdline_runtime_enable_locked();
+	ksu_susfs_cmdline_last_err = err;
+	mutex_unlock(&ksu_susfs_cmdline_patch_lock);
+
+	return err;
+}
+
+static void ksu_susfs_cmdline_retry_fn(struct work_struct *work)
+{
+	if (!ksu_susfs_cmdline_runtime_enable()) {
+		return;
 	}
 
-	return 0;
+	if (!READ_ONCE(ksu_boot_completed)) {
+		ksu_susfs_schedule_cmdline_retry(
+			msecs_to_jiffies(KSU_SUSFS_CMDLINE_RETRY_DELAY_MS));
+	}
+}
+
+static void ksu_susfs_cmdline_runtime_disable(void)
+{
+	cancel_delayed_work_sync(&ksu_susfs_cmdline_retry_work);
+	mutex_lock(&ksu_susfs_cmdline_patch_lock);
+	if (ksu_susfs_orig_saved_command_line) {
+		WRITE_ONCE(saved_command_line,
+			   ksu_susfs_orig_saved_command_line);
+	}
+	kfree(ksu_susfs_cmdline_shadow);
+	ksu_susfs_cmdline_shadow = NULL;
+	ksu_susfs_orig_saved_command_line = NULL;
+	ksu_susfs_cmdline_ready = false;
+	ksu_susfs_cmdline_last_err = 0;
+	mutex_unlock(&ksu_susfs_cmdline_patch_lock);
+}
+
+void ksu_susfs_handle_boot_completed(void)
+{
+	ksu_susfs_prop_hygiene_attempts = 0;
+	mod_delayed_work(system_wq, &ksu_susfs_prop_hygiene_restore_work,
+			 msecs_to_jiffies(
+				 KSU_SUSFS_PROP_HYGIENE_INITIAL_DELAY_MS));
 }
 
 static long __nocfi ksu_susfs_hook_uname(int orig_nr, const struct pt_regs *regs)
@@ -1094,6 +1198,7 @@ out:
 bool ksu_susfs_handle_cmdline_compat(void __user *arg)
 {
 	struct ksu_susfs_cmdline_cmd *cmd;
+	int patch_err = 0;
 
 	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
 	if (!cmd) {
@@ -1113,16 +1218,17 @@ bool ksu_susfs_handle_cmdline_compat(void __user *arg)
 		goto out;
 	}
 
-	if (!ksu_susfs_cmdline_ready) {
-		cmd->err = -EOPNOTSUPP;
-		goto out;
-	}
-
 	if (!strcmp(cmd->fake_cmdline_or_bootconfig, "default")) {
 		if (static_key_enabled(&ksu_susfs_cmdline_spoof_enabled)) {
 			static_branch_disable(&ksu_susfs_cmdline_spoof_enabled);
 		}
 		memset(ksu_susfs_fake_cmdline, 0, sizeof(ksu_susfs_fake_cmdline));
+		patch_err = ksu_susfs_cmdline_runtime_enable();
+		if (patch_err && !READ_ONCE(ksu_boot_completed)) {
+			ksu_susfs_schedule_cmdline_retry(
+				msecs_to_jiffies(
+					KSU_SUSFS_CMDLINE_RETRY_DELAY_MS));
+		}
 		cmd->err = 0;
 		goto out;
 	}
@@ -1132,13 +1238,28 @@ bool ksu_susfs_handle_cmdline_compat(void __user *arg)
 		goto out;
 	}
 
-	write_seqlock(&ksu_susfs_cmdline_lock);
 	strscpy(ksu_susfs_fake_cmdline, cmd->fake_cmdline_or_bootconfig,
 		sizeof(ksu_susfs_fake_cmdline));
-	write_sequnlock(&ksu_susfs_cmdline_lock);
 
 	if (!static_key_enabled(&ksu_susfs_cmdline_spoof_enabled)) {
 		static_branch_enable(&ksu_susfs_cmdline_spoof_enabled);
+	}
+
+	patch_err = ksu_susfs_cmdline_runtime_enable();
+	if (!ksu_susfs_cmdline_ready) {
+		if (!READ_ONCE(ksu_boot_completed)) {
+			ksu_susfs_schedule_cmdline_retry(
+				msecs_to_jiffies(
+					KSU_SUSFS_CMDLINE_RETRY_DELAY_MS));
+			cmd->err = 0;
+			goto out;
+		}
+
+		cmd->err = patch_err ? patch_err :
+			   (ksu_susfs_cmdline_last_err ?
+				    ksu_susfs_cmdline_last_err :
+				    -EOPNOTSUPP);
+		goto out;
 	}
 
 	cmd->err = 0;
@@ -1245,11 +1366,11 @@ int ksu_susfs_procfs_init(void)
 	memset(&ksu_susfs_fake_uname, 0, sizeof(ksu_susfs_fake_uname));
 	memset(ksu_susfs_fake_cmdline, 0, sizeof(ksu_susfs_fake_cmdline));
 
-	ret = ksu_susfs_cmdline_replace(true);
+	ret = ksu_susfs_cmdline_runtime_enable();
 	if (ret) {
-		pr_err("susfs: failed to replace /proc/cmdline: %d\n", ret);
-	} else {
-		ksu_susfs_cmdline_ready = true;
+		pr_info("susfs: /proc/cmdline not ready yet: %d\n", ret);
+		ksu_susfs_schedule_cmdline_retry(
+			msecs_to_jiffies(KSU_SUSFS_CMDLINE_RETRY_DELAY_MS));
 	}
 
 	ret = ksu_susfs_mount_runtime_enable();
@@ -1282,12 +1403,9 @@ void ksu_susfs_procfs_exit(void)
 		static_branch_disable(&ksu_susfs_uname_spoof_enabled);
 	}
 
-	if (ksu_susfs_cmdline_ready) {
-		if (ksu_susfs_cmdline_replace(false)) {
-			pr_err("susfs: failed to restore /proc/cmdline\n");
-		}
-		ksu_susfs_cmdline_ready = false;
-	}
+	ksu_susfs_cmdline_runtime_disable();
+	ksu_susfs_cmdline_ready = false;
+	cancel_delayed_work_sync(&ksu_susfs_prop_hygiene_restore_work);
 
 	if (static_key_enabled(&ksu_susfs_cmdline_spoof_enabled)) {
 		static_branch_disable(&ksu_susfs_cmdline_spoof_enabled);

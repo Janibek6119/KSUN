@@ -119,15 +119,10 @@ static LIST_HEAD(ksu_susfs_kstat_list);
 static LIST_HEAD(ksu_susfs_sus_map_list);
 static DEFINE_MUTEX(ksu_susfs_kstat_lock);
 static DEFINE_MUTEX(ksu_susfs_sus_map_lock);
-static DEFINE_MUTEX(ksu_susfs_maps_seq_ops_lock);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_kstat_enabled);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_sus_map_enabled);
 
 static struct kretprobe *ksu_susfs_vfs_getattr_nosec_rp;
-static int (*ksu_susfs_orig_pid_maps_open)(struct inode *inode,
-					   struct file *file);
-static int (*ksu_susfs_orig_pid_smaps_open)(struct inode *inode,
-					    struct file *file);
 static int (*ksu_susfs_orig_pid_smaps_rollup_open)(struct inode *inode,
 						   struct file *file);
 static ssize_t (*ksu_susfs_orig_pagemap_read)(struct file *file,
@@ -144,11 +139,8 @@ static ssize_t (*ksu_susfs_orig_mem_read)(struct file *file, char __user *buf,
 static ssize_t (*ksu_susfs_orig_mem_write)(struct file *file,
 					   const char __user *buf,
 					   size_t count, loff_t *ppos);
-static struct seq_operations ksu_susfs_maps_seq_ops;
-static struct seq_operations ksu_susfs_smaps_seq_ops;
-static struct seq_operations ksu_susfs_smaps_wrapper_seq_ops;
-static bool ksu_susfs_maps_seq_ops_ready;
-static bool ksu_susfs_smaps_seq_ops_ready;
+static int (*ksu_susfs_orig_maps_show)(struct seq_file *m, void *v);
+static int (*ksu_susfs_orig_smaps_show)(struct seq_file *m, void *v);
 static bool ksu_susfs_getattr_ready;
 static bool ksu_susfs_maps_ready;
 static bool ksu_susfs_smaps_ready;
@@ -165,10 +157,29 @@ static const struct file_operations *ksu_susfs_map_files_fops;
 static const struct inode_operations *ksu_susfs_map_files_iops;
 static const struct dentry_operations *ksu_susfs_map_files_dops;
 static const struct file_operations *ksu_susfs_mem_fops;
+static const struct seq_operations *ksu_susfs_maps_seqops;
+static const struct seq_operations *ksu_susfs_smaps_seqops;
 static instantiate_t *ksu_susfs_map_files_instantiate;
 
 #define KSU_SUSFS_PAGEMAP_ENTRY_BYTES sizeof(u64)
 #define KSU_SUSFS_PSS_SHIFT 12
+
+/*
+ * The hookless sus_map runtime layer intentionally stays close to the
+ * upstream SUSFS procfs patch surface. Direct map_files lookup/revalidate and
+ * /proc/<pid>/mem patching were found to destabilize LSPosed preload mappings
+ * during live-device testing, so we keep those stock for now.
+ */
+static const bool ksu_susfs_sus_map_map_files_lookup_enabled = false;
+static const bool ksu_susfs_sus_map_proc_mem_enabled = false;
+/*
+ * The broader proc/mm wrappers still hard-lock the device when a live LSPosed
+ * preload mapping is registered via add_sus_map. Keep hookless sus_map on the
+ * low-risk procfs surface until those paths are narrowed down.
+ */
+static const bool ksu_susfs_sus_map_smaps_rollup_enabled = false;
+static const bool ksu_susfs_sus_map_pagemap_enabled = false;
+static const bool ksu_susfs_sus_map_map_files_iterate_enabled = false;
 
 static bool ksu_susfs_kstat_compat_root_allowed(void)
 {
@@ -207,6 +218,12 @@ static bool ksu_susfs_sus_map_should_hide_current(void)
 	}
 
 	return ksu_susfs_proc_mm_view_allowed_current();
+}
+
+static bool ksu_susfs_proc_maps_view_enabled_current(void)
+{
+	return ksu_susfs_kstat_should_spoof_current() ||
+	       ksu_susfs_sus_map_should_hide_current();
 }
 
 static int ksu_susfs_kstat_normalize_path(char *dst, size_t dst_size,
@@ -532,6 +549,53 @@ static void ksu_susfs_restore_fop_open(const struct file_operations *fops,
 	}
 
 	*old_open = NULL;
+}
+
+static int ksu_susfs_patch_seqop_show(
+	const struct seq_operations *seqops,
+	int (*new_show)(struct seq_file *, void *),
+	int (**old_show)(struct seq_file *, void *))
+{
+	int (*orig_show)(struct seq_file *m, void *v);
+	void *dst;
+
+	if (!seqops || !new_show) {
+		return -EINVAL;
+	}
+
+	orig_show = READ_ONCE(seqops->show);
+	if (!orig_show) {
+		return -EINVAL;
+	}
+
+	if (old_show) {
+		*old_show = orig_show;
+	}
+
+	dst = (void *)&((struct seq_operations *)seqops)->show;
+	return ksu_patch_text(dst, &new_show, sizeof(new_show),
+			      KSU_PATCH_TEXT_FLUSH_DCACHE);
+}
+
+static void ksu_susfs_restore_seqop_show(
+	const struct seq_operations *seqops,
+	int (**old_show)(struct seq_file *, void *))
+{
+	int (*orig_show)(struct seq_file *m, void *v);
+	void *dst;
+
+	if (!seqops || !old_show || !*old_show) {
+		return;
+	}
+
+	orig_show = *old_show;
+	dst = (void *)&((struct seq_operations *)seqops)->show;
+	if (ksu_patch_text(dst, &orig_show, sizeof(orig_show),
+			   KSU_PATCH_TEXT_FLUSH_DCACHE)) {
+		pr_err("susfs: failed to restore seq show\n");
+	}
+
+	*old_show = NULL;
 }
 
 static int ksu_susfs_patch_fop_read(
@@ -1030,6 +1094,10 @@ static void ksu_susfs_show_map_vma(struct seq_file *m,
 	dev_t dev = 0;
 	const char *name = NULL;
 
+	if (ksu_susfs_sus_map_match_vma(vma)) {
+		return;
+	}
+
 	if (file) {
 		struct inode *inode = file_inode(file);
 
@@ -1093,9 +1161,9 @@ static int ksu_susfs_show_map(struct seq_file *m, void *v)
 {
 	struct vm_area_struct *vma = v;
 
-	if (ksu_susfs_sus_map_match_vma(vma)) {
-		ksu_susfs_m_cache_vma(m, vma);
-		return 0;
+	if (!ksu_susfs_proc_maps_view_enabled_current()) {
+		return ksu_susfs_orig_maps_show ? ksu_susfs_orig_maps_show(m, v) :
+						 -ENOSYS;
 	}
 
 	if (vma_pages(vma)) {
@@ -1104,37 +1172,6 @@ static int ksu_susfs_show_map(struct seq_file *m, void *v)
 
 	show_map_pad_vma(vma, m, (void *)ksu_susfs_show_map_vma, false);
 	ksu_susfs_m_cache_vma(m, vma);
-	return 0;
-}
-
-static int ksu_susfs_pid_maps_open(struct inode *inode, struct file *file)
-{
-	struct seq_file *m;
-	int ret;
-
-	if (!ksu_susfs_orig_pid_maps_open) {
-		return -ENOSYS;
-	}
-
-	ret = ksu_susfs_orig_pid_maps_open(inode, file);
-	if (ret) {
-		return ret;
-	}
-
-	m = file->private_data;
-	if (!m || !m->op) {
-		return ret;
-	}
-
-	mutex_lock(&ksu_susfs_maps_seq_ops_lock);
-	if (!ksu_susfs_maps_seq_ops_ready) {
-		ksu_susfs_maps_seq_ops = *m->op;
-		ksu_susfs_maps_seq_ops.show = ksu_susfs_show_map;
-		ksu_susfs_maps_seq_ops_ready = true;
-	}
-	mutex_unlock(&ksu_susfs_maps_seq_ops_lock);
-
-	m->op = &ksu_susfs_maps_seq_ops;
 	return 0;
 }
 
@@ -1234,16 +1271,21 @@ static int ksu_susfs_show_smap(struct seq_file *m, void *v)
 	size_t start = m->count;
 	int ret;
 
+	if (!ksu_susfs_proc_maps_view_enabled_current()) {
+		return ksu_susfs_orig_smaps_show ? ksu_susfs_orig_smaps_show(m, v) :
+						  -ENOSYS;
+	}
+
 	if (ksu_susfs_sus_map_match_vma(vma)) {
 		ksu_susfs_m_cache_vma(m, vma);
 		return 0;
 	}
 
-	if (!ksu_susfs_smaps_seq_ops.show) {
+	if (!ksu_susfs_orig_smaps_show) {
 		return -ENOSYS;
 	}
 
-	ret = ksu_susfs_smaps_seq_ops.show(m, v);
+	ret = ksu_susfs_orig_smaps_show(m, v);
 	if (ret || seq_has_overflowed(m)) {
 		return ret;
 	}
@@ -1254,39 +1296,6 @@ static int ksu_susfs_show_smap(struct seq_file *m, void *v)
 
 	ksu_susfs_rewrite_smap_prefix(m, vma, start);
 	return ret;
-}
-
-static int ksu_susfs_pid_smaps_open(struct inode *inode, struct file *file)
-{
-	struct seq_file *m;
-	int ret;
-
-	if (!ksu_susfs_orig_pid_smaps_open) {
-		return -ENOSYS;
-	}
-
-	ret = ksu_susfs_orig_pid_smaps_open(inode, file);
-	if (ret) {
-		return ret;
-	}
-
-	m = file->private_data;
-	if (!m || !m->op) {
-		return ret;
-	}
-
-	mutex_lock(&ksu_susfs_maps_seq_ops_lock);
-	if (!ksu_susfs_smaps_seq_ops_ready) {
-		ksu_susfs_smaps_seq_ops = *m->op;
-		ksu_susfs_smaps_wrapper_seq_ops = *m->op;
-		ksu_susfs_smaps_wrapper_seq_ops.show = ksu_susfs_show_smap;
-		ksu_susfs_smaps_seq_ops_ready = true;
-	}
-	mutex_unlock(&ksu_susfs_maps_seq_ops_lock);
-
-	m->op = &ksu_susfs_smaps_wrapper_seq_ops;
-
-	return 0;
 }
 
 static void ksu_susfs_smaps_page_accumulate(
@@ -1663,6 +1672,7 @@ static int ksu_susfs_show_smaps_rollup(struct seq_file *m, void *v)
 
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		if (ksu_susfs_sus_map_match_vma(vma)) {
+			last_vma_end = vma->vm_end;
 			continue;
 		}
 
@@ -1698,6 +1708,14 @@ static int ksu_susfs_pid_smaps_rollup_open(struct inode *inode,
 {
 	struct proc_maps_private *priv;
 	int ret;
+
+	if (!ksu_susfs_orig_pid_smaps_rollup_open) {
+		return -ENOSYS;
+	}
+
+	if (!ksu_susfs_proc_maps_view_enabled_current()) {
+		return ksu_susfs_orig_pid_smaps_rollup_open(inode, file);
+	}
 
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL_ACCOUNT);
 	if (!priv) {
@@ -2553,123 +2571,148 @@ int ksu_susfs_kstat_init(void)
 	}
 	ksu_susfs_getattr_ready = true;
 
-	err = ksu_susfs_patch_fop_open(&proc_pid_maps_operations,
-				       ksu_susfs_pid_maps_open,
-				       &ksu_susfs_orig_pid_maps_open);
-	if (err) {
-		pr_warn("susfs: proc maps wrapper unavailable: %d\n", err);
-	} else {
-		ksu_susfs_maps_ready = true;
-	}
-
-	err = ksu_susfs_patch_fop_open(&proc_pid_smaps_operations,
-				       ksu_susfs_pid_smaps_open,
-				       &ksu_susfs_orig_pid_smaps_open);
-	if (err) {
-		pr_warn("susfs: proc smaps wrapper unavailable: %d\n", err);
-	} else {
-		ksu_susfs_smaps_ready = true;
-	}
-
-	err = ksu_susfs_patch_fop_open(&proc_pid_smaps_rollup_operations,
-				       ksu_susfs_pid_smaps_rollup_open,
-				       &ksu_susfs_orig_pid_smaps_rollup_open);
-	if (err) {
-		pr_warn("susfs: proc smaps_rollup wrapper unavailable: %d\n",
-			err);
-	} else {
-		ksu_susfs_smaps_rollup_ready = true;
-	}
-
-	err = ksu_susfs_patch_fop_read(&proc_pagemap_operations,
-				       ksu_susfs_pagemap_read,
-				       &ksu_susfs_orig_pagemap_read);
-	if (err) {
-		pr_warn("susfs: proc pagemap wrapper unavailable: %d\n", err);
-	} else {
-		ksu_susfs_pagemap_ready = true;
-	}
-
-	ksu_susfs_map_files_instantiate =
-		(instantiate_t *)ksu_resolve_symbol_for_functable_hook(
-			"proc_map_files_instantiate");
-
-	addr = find_kernel_symbol_exact("proc_map_files_operations");
+	addr = find_kernel_symbol_exact("proc_pid_maps_op");
 	if (addr) {
-		ksu_susfs_map_files_fops =
-			(const struct file_operations *)addr;
-		err = ksu_susfs_patch_fop_iterate_shared(
-			ksu_susfs_map_files_fops,
-			ksu_susfs_map_files_iterate_shared,
-			&ksu_susfs_orig_map_files_iterate_shared);
+		ksu_susfs_maps_seqops = (const struct seq_operations *)addr;
+		err = ksu_susfs_patch_seqop_show(ksu_susfs_maps_seqops,
+						 ksu_susfs_show_map,
+						 &ksu_susfs_orig_maps_show);
 		if (err) {
-			pr_warn("susfs: proc map_files iterate wrapper unavailable: %d\n",
+			pr_warn("susfs: proc maps seq wrapper unavailable: %d\n",
 				err);
-			ksu_susfs_map_files_fops = NULL;
+			ksu_susfs_maps_seqops = NULL;
 		} else {
-			ksu_susfs_map_files_iterate_ready = true;
+			ksu_susfs_maps_ready = true;
 		}
 	}
 
-	addr = find_kernel_symbol_exact("proc_map_files_inode_operations");
+	addr = find_kernel_symbol_exact("proc_pid_smaps_op");
 	if (addr) {
-		ksu_susfs_map_files_iops =
-			(const struct inode_operations *)addr;
-		err = ksu_susfs_patch_iop_lookup(
-			ksu_susfs_map_files_iops, ksu_susfs_map_files_lookup,
-			&ksu_susfs_orig_map_files_lookup);
+		ksu_susfs_smaps_seqops = (const struct seq_operations *)addr;
+		err = ksu_susfs_patch_seqop_show(ksu_susfs_smaps_seqops,
+						 ksu_susfs_show_smap,
+						 &ksu_susfs_orig_smaps_show);
 		if (err) {
-			pr_warn("susfs: proc map_files lookup wrapper unavailable: %d\n",
+			pr_warn("susfs: proc smaps seq wrapper unavailable: %d\n",
 				err);
-			ksu_susfs_map_files_iops = NULL;
+			ksu_susfs_smaps_seqops = NULL;
 		} else {
-			ksu_susfs_map_files_lookup_ready = true;
+			ksu_susfs_smaps_ready = true;
 		}
 	}
 
-	addr = find_kernel_symbol_exact("tid_map_files_dentry_operations");
-	if (addr) {
-		ksu_susfs_map_files_dops =
-			(const struct dentry_operations *)addr;
-		err = ksu_susfs_patch_dop_d_revalidate(
-			ksu_susfs_map_files_dops,
-			ksu_susfs_map_files_d_revalidate,
-			&ksu_susfs_orig_map_files_d_revalidate);
+	if (ksu_susfs_sus_map_smaps_rollup_enabled) {
+		err = ksu_susfs_patch_fop_open(
+			&proc_pid_smaps_rollup_operations,
+			ksu_susfs_pid_smaps_rollup_open,
+			&ksu_susfs_orig_pid_smaps_rollup_open);
 		if (err) {
-			pr_warn("susfs: proc map_files d_revalidate wrapper unavailable: %d\n",
+			pr_warn("susfs: proc smaps_rollup wrapper unavailable: %d\n",
 				err);
-			ksu_susfs_map_files_dops = NULL;
 		} else {
-			ksu_susfs_map_files_d_revalidate_ready = true;
+			ksu_susfs_smaps_rollup_ready = true;
 		}
 	}
 
-	addr = find_kernel_symbol_exact("proc_mem_operations");
-	if (addr) {
-		ksu_susfs_mem_fops = (const struct file_operations *)addr;
-
-		err = ksu_susfs_patch_fop_read(ksu_susfs_mem_fops,
-					       ksu_susfs_mem_read,
-					       &ksu_susfs_orig_mem_read);
+	if (ksu_susfs_sus_map_pagemap_enabled) {
+		err = ksu_susfs_patch_fop_read(&proc_pagemap_operations,
+					       ksu_susfs_pagemap_read,
+					       &ksu_susfs_orig_pagemap_read);
 		if (err) {
-			pr_warn("susfs: proc mem read wrapper unavailable: %d\n",
-				err);
-			ksu_susfs_mem_fops = NULL;
+			pr_warn("susfs: proc pagemap wrapper unavailable: %d\n", err);
 		} else {
-			ksu_susfs_mem_read_ready = true;
-			err = ksu_susfs_patch_fop_write(
-				ksu_susfs_mem_fops, ksu_susfs_mem_write,
-				&ksu_susfs_orig_mem_write);
+			ksu_susfs_pagemap_ready = true;
+		}
+	}
+
+	if (ksu_susfs_sus_map_map_files_iterate_enabled) {
+		ksu_susfs_map_files_instantiate =
+			(instantiate_t *)ksu_resolve_symbol_for_functable_hook(
+				"proc_map_files_instantiate");
+
+		addr = find_kernel_symbol_exact("proc_map_files_operations");
+		if (addr) {
+			ksu_susfs_map_files_fops =
+				(const struct file_operations *)addr;
+			err = ksu_susfs_patch_fop_iterate_shared(
+				ksu_susfs_map_files_fops,
+				ksu_susfs_map_files_iterate_shared,
+				&ksu_susfs_orig_map_files_iterate_shared);
 			if (err) {
-				pr_warn("susfs: proc mem write wrapper unavailable: %d\n",
+				pr_warn("susfs: proc map_files iterate wrapper unavailable: %d\n",
 					err);
-				ksu_susfs_restore_fop_read(
-					ksu_susfs_mem_fops,
-					&ksu_susfs_orig_mem_read);
-				ksu_susfs_mem_read_ready = false;
+				ksu_susfs_map_files_fops = NULL;
+			} else {
+				ksu_susfs_map_files_iterate_ready = true;
+			}
+		}
+	}
+
+	if (ksu_susfs_sus_map_map_files_lookup_enabled) {
+		addr = find_kernel_symbol_exact("proc_map_files_inode_operations");
+		if (addr) {
+			ksu_susfs_map_files_iops =
+				(const struct inode_operations *)addr;
+			err = ksu_susfs_patch_iop_lookup(
+				ksu_susfs_map_files_iops,
+				ksu_susfs_map_files_lookup,
+				&ksu_susfs_orig_map_files_lookup);
+			if (err) {
+				pr_warn("susfs: proc map_files lookup wrapper unavailable: %d\n",
+					err);
+				ksu_susfs_map_files_iops = NULL;
+			} else {
+				ksu_susfs_map_files_lookup_ready = true;
+			}
+		}
+
+		addr = find_kernel_symbol_exact("tid_map_files_dentry_operations");
+		if (addr) {
+			ksu_susfs_map_files_dops =
+				(const struct dentry_operations *)addr;
+			err = ksu_susfs_patch_dop_d_revalidate(
+				ksu_susfs_map_files_dops,
+				ksu_susfs_map_files_d_revalidate,
+				&ksu_susfs_orig_map_files_d_revalidate);
+			if (err) {
+				pr_warn("susfs: proc map_files d_revalidate wrapper unavailable: %d\n",
+					err);
+				ksu_susfs_map_files_dops = NULL;
+			} else {
+				ksu_susfs_map_files_d_revalidate_ready = true;
+			}
+		}
+	}
+
+	if (ksu_susfs_sus_map_proc_mem_enabled) {
+		addr = find_kernel_symbol_exact("proc_mem_operations");
+		if (addr) {
+			ksu_susfs_mem_fops = (const struct file_operations *)addr;
+
+			err = ksu_susfs_patch_fop_read(ksu_susfs_mem_fops,
+						       ksu_susfs_mem_read,
+						       &ksu_susfs_orig_mem_read);
+			if (err) {
+				pr_warn("susfs: proc mem read wrapper unavailable: %d\n",
+					err);
 				ksu_susfs_mem_fops = NULL;
 			} else {
-				ksu_susfs_mem_write_ready = true;
+				ksu_susfs_mem_read_ready = true;
+				err = ksu_susfs_patch_fop_write(
+					ksu_susfs_mem_fops,
+					ksu_susfs_mem_write,
+					&ksu_susfs_orig_mem_write);
+				if (err) {
+					pr_warn("susfs: proc mem write wrapper unavailable: %d\n",
+						err);
+					ksu_susfs_restore_fop_read(
+						ksu_susfs_mem_fops,
+						&ksu_susfs_orig_mem_read);
+					ksu_susfs_mem_read_ready = false;
+					ksu_susfs_mem_fops = NULL;
+				} else {
+					ksu_susfs_mem_write_ready = true;
+				}
 			}
 		}
 	}
@@ -2729,19 +2772,18 @@ void ksu_susfs_kstat_exit(void)
 	}
 
 	if (ksu_susfs_smaps_ready) {
-		ksu_susfs_restore_fop_open(&proc_pid_smaps_operations,
-					   &ksu_susfs_orig_pid_smaps_open);
+		ksu_susfs_restore_seqop_show(ksu_susfs_smaps_seqops,
+					     &ksu_susfs_orig_smaps_show);
 		ksu_susfs_smaps_ready = false;
 	}
+	ksu_susfs_smaps_seqops = NULL;
 
 	if (ksu_susfs_maps_ready) {
-		ksu_susfs_restore_fop_open(&proc_pid_maps_operations,
-					   &ksu_susfs_orig_pid_maps_open);
+		ksu_susfs_restore_seqop_show(ksu_susfs_maps_seqops,
+					     &ksu_susfs_orig_maps_show);
 		ksu_susfs_maps_ready = false;
 	}
-
-	ksu_susfs_maps_seq_ops_ready = false;
-	ksu_susfs_smaps_seq_ops_ready = false;
+	ksu_susfs_maps_seqops = NULL;
 
 	ksu_susfs_destroy_kretprobe(&ksu_susfs_vfs_getattr_nosec_rp);
 	ksu_susfs_getattr_ready = false;

@@ -41,5 +41,6 @@
 void ksu_susfs_init(void);
 void ksu_susfs_exit(void);
 bool ksu_susfs_handle_compat(unsigned int cmd, void __user *arg);
+void ksu_susfs_handle_boot_completed(void);
 
 #endif // __KSU_H_SUSFS

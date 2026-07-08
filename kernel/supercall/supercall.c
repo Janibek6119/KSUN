@@ -32,6 +32,14 @@ struct ksu_install_fd_tw {
     struct callback_head cb;
     int __user *outp;
 };
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+struct ksu_susfs_tw {
+    struct callback_head cb;
+    unsigned int cmd;
+    void __user *arg;
+};
+#endif
 #endif
 
 static int anon_ksu_release(struct inode *inode, struct file *filp)
@@ -89,6 +97,21 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
 
     kfree(tw);
 }
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+static void ksu_susfs_tw_func(struct callback_head *cb)
+{
+    struct ksu_susfs_tw *tw = container_of(cb, struct ksu_susfs_tw, cb);
+
+    /*
+     * SUSFS compat handlers resolve paths, take mutexes, and touch
+     * user buffers, so they must not run from the reboot kprobe's
+     * atomic pre-handler context.
+     */
+    ksu_susfs_handle_compat(tw->cmd, tw->arg);
+    kfree(tw);
+}
+#endif
 #endif
 
 int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
@@ -284,7 +307,21 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 
 #ifdef CONFIG_KSU_KPROBES_SUSFS
     if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_SUSFS_MAGIC) {
-        ksu_susfs_handle_compat(cmd, (void __user *)arg4);
+        struct ksu_susfs_tw *tw;
+
+        tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+        if (!tw)
+            return 0;
+
+        tw->cmd = cmd;
+        tw->arg = (void __user *)arg4;
+        tw->cb.func = ksu_susfs_tw_func;
+
+        if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+            kfree(tw);
+            pr_warn("susfs add task_work failed\n");
+        }
+
         return 0;
     }
 #endif
