@@ -1,367 +1,247 @@
-# SUSFS Hookless Design Notes
+# SUSFS Hookless
+
+## Overview
+
+`susfs-hookless` moves SUSFS integration out of main-kernel source patches and
+into `KernelSU-Next` only.
+
+The target configuration is:
+
+- `CONFIG_KSU_KPROBES_HOOK=y`
+- `CONFIG_KSU_KPROBES_SUSFS=y`
+
+On the Lisa kernel tree, `drivers/kernelsu` resolves to
+`KernelSU-Next/kernel`, so the hookless SUSFS layer is consumed through the
+existing KernelSU build path without adding new `fs/` or `include/` files to
+the main kernel tree.
 
 ## Goal
 
-Move SUSFS away from patching core kernel source files like `fs/namei.c`,
-`fs/readdir.c`, `fs/stat.c`, `fs/statfs.c`, `fs/proc/*`, `mm/*`, and
-`security/selinux/*`.
+The goal is not "zero hooks anywhere".
 
-The target environment is `KernelSU-Next` with `CONFIG_KSU_KPROBES_HOOK=y`.
-Modifying `KernelSU-Next` is allowed. Patching the main kernel tree should be
-avoided.
+The goal is:
 
-## Why NoMount Is "Hookless"
+- no manual source patching across generic kernel files such as `fs/*`,
+  `mm/*`, `kernel/sys.c`, or `security/selinux/*`
+- all SUSFS maintenance kept inside `KernelSU-Next`
+- runtime behavior that stays close to upstream SUSFS where it matters for
+  userspace compatibility
 
-The `origin/experimental/hookless` branch of NoMount does not patch generic VFS
-entry points anymore. Its kernel integration patch only adds:
+## Design Model
 
-- `fs/Kconfig`
-- `fs/Makefile`
+Hookless SUSFS uses a hybrid model.
 
-The actual interception is done at runtime by hijacking per-object operation
-tables:
+Path-facing features follow the same general idea as NoMount:
 
-- `inode->i_op`
-- `inode->i_fop`
-- `sb->s_op`
-- `sb->s_xattr`
+- store policy inside a KSU-owned rule engine
+- hijack only affected per-object operation tables at runtime
+- avoid global VFS edits
 
-It then:
+Global proc/mm surfaces use small KSU-owned runtime instrumentation:
 
-1. Builds a virtual topology for affected parent directories.
-2. Swaps lookup and iterate callbacks only on those directories.
-3. Creates synthetic front-facing inodes for virtual or redirected entries.
-4. Delegates real IO to backend inodes while keeping the VFS surface local to
-   the affected objects.
+- kprobes and kretprobes
+- runtime procfs file-operation replacement
+- runtime `seq_operations` replacement
+- existing KSU hooks where they are already available
 
-This is why NoMount no longer needs per-kernel patches in `namei.c`,
-`readdir.c`, `stat.c`, `statfs.c`, `task_mmu.c`, or `d_path.c`.
+This keeps the maintenance boundary narrow while still covering SUSFS features
+that cannot be expressed as a pure VFS overlay.
 
-## Why SUSFS Is Harder
+## Source Layout
 
-Current SUSFS is split into two parts:
+The hookless implementation lives under `KernelSU-Next/kernel/`:
 
-1. State and rule storage in `fs/susfs.c`.
-2. A wide patch set that injects SUSFS checks into generic kernel paths.
+- `kernel/susfs/`
+- `kernel/hook/`
+- `kernel/infra/`
+- `kernel/supercall/`
 
-The current patch set touches many files because SUSFS covers several different
-problem classes:
+There is no dependency on the old `susfs4ksu/kernel_patches/50_add_*` main
+kernel patch path.
 
-- `sus_path`: pathname hiding
-- `open_redirect`: pathname redirection
-- `sus_kstat`: metadata spoofing
-- `sus_map`: proc/mm mapping hiding
-- `sus_mount`: mountinfo and mount namespace hiding
-- `spoof_uname`
-- `spoof_cmdline_or_bootconfig`
-- `avc_log_spoofing`
+## Runtime Architecture
 
-Not all of these can be solved with the same NoMount-style VFS object hijack.
+### Path and redirect layer
 
-## Important Observation For This Tree
+`sus_path` and `open_redirect` are implemented as a local runtime overlay:
 
-In this kernel, `drivers/kernelsu` is a symlink to
-`KernelSU-Next/kernel`. That means SUSFS can live inside `KernelSU-Next` and be
-linked into the kernel as part of the existing KernelSU object set.
+- rules are stored inside `KernelSU-Next`
+- affected parent directories have their `i_op.lookup` replaced
+- affected parent directories have their `i_fop.iterate*` replaced
+- redirected entries are fronted by synthetic inodes backed by real objects
 
-That gives us a much better route than `susfs4ksu` uses today:
+This removes the need for main-kernel edits in generic pathname resolution and
+directory iteration code.
 
-- no `fs/Makefile` patch for `susfs.o`
-- no `include/linux/susfs*.h` patch into the main tree
-- no direct source edits to generic kernel code
+### Metadata spoofing
 
-Instead, SUSFS can become an internal KernelSU subsystem.
+`sus_kstat` is split into two cases:
 
-## Proposed Architecture
+- virtual or redirected entries use the synthetic front-end path
+- standalone files use a KSU-owned compatibility layer
 
-### 1. Build A KSU-Hosted SUSFS Core
+The standalone compatibility layer currently uses:
 
-Add a new SUSFS subsystem under `KernelSU-Next/kernel/`, for example:
+- a `vfs_getattr_nosec()` kretprobe
+- runtime replacement of proc `maps` and `smaps` `seq_operations.show`
 
-- `kernel/susfs/core.c`
-- `kernel/susfs/path.c`
-- `kernel/susfs/redirect.c`
-- `kernel/susfs/proc.c`
-- `kernel/susfs/mount.c`
-- `kernel/susfs/policy.c`
+### Mount hiding
 
-And add corresponding `Kconfig` and `Kbuild` entries inside `KernelSU-Next`.
+Mount hiding is implemented from inside KernelSU by rewriting procfs mount
+views at runtime instead of patching procfs source files.
 
-### 2. Replace Per-Inode Flag Hiding With Rule-Based Virtual Topology
+The current layer covers:
 
-Current `sus_path` depends on:
+- `/proc/*/mounts`
+- `/proc/*/mountinfo`
+- `/proc/*/mountstats`
+- `/proc/*/fdinfo/*`
 
-- setting custom bits in `inode->i_mapping->flags`
-- checking those bits from patched `namei.c` and `readdir.c`
+The rewritten view is intentionally scoped to the same SUSFS-targeted app and
+isolated UIDs. Root and zygote-side readers stay on the stock kernel path.
 
-That model is the main reason kernel patching is required.
+### Mount namespace normalization
 
-Instead, `sus_path` should move to the same model used by NoMount:
+Helper and isolated app processes can start in a different mount namespace even
+when they belong to the same package. To keep SUSFS mount hiding coherent, the
+hookless layer normalizes package-local helpers onto the package's visible main
+namespace.
 
-- hash rules by virtual path
-- keep parent directory nodes
-- keep child arrays per affected parent
-- hijack only the affected parent `i_op.lookup`
-- hijack only the affected parent `i_fop.iterate*`
+The current flow is:
 
-This turns `sus_path` from a global lookup filter into a local virtual-filesystem
-overlay.
+1. SUSFS receives the KSU setuid callback.
+2. Work is deferred through task work so the logic does not run in atomic
+   kprobe context.
+3. The main package process is cached as a package anchor.
+4. Same-package helpers such as `:tools` or isolated children try to join the
+   anchor's mount namespace.
+5. `ksu_join_task_mount_ns()` duplicates `current->fs` with
+   `unshare_fs_struct()` when needed so `setns(CLONE_NEWNS)` satisfies the
+   5.4 kernel `mntns_install()` requirement.
 
-### 3. Merge `open_redirect` Into The Same Front-End
+Namespace identity readback is normalized separately through the KSU-owned
+`mntns_get()` kretprobe so `/proc/*/ns/mnt`, `readlink()`, and namespace-fd
+identity stay aligned with the visible namespace.
 
-`open_redirect` does not need a global `open.c` path rewrite if lookup returns a
-synthetic inode for the virtual target.
+### Proc/mm hiding
 
-That synthetic inode can carry:
+`sus_map` is implemented through runtime proc/mm compatibility hooks rather than
+through main-kernel patches.
 
-- visible virtual path identity
-- backend real inode or backend real file
-- spoofed metadata profile
-- access policy
+Today the live hookless coverage is intentionally limited to:
 
-This lets one front-end cover:
+- `/proc/*/maps`
+- `/proc/*/smaps`
 
-- `sus_path`
-- `open_redirect`
-- most of `sus_kstat`
+This is the stable subset that was validated without the earlier BRENE crash
+path.
 
-### 4. Prefer Synthetic Inodes Over Global Getattr Hooks
+### Cmdline, uname, AVC, and property hygiene
 
-For redirected or hidden entries, metadata spoofing should be served by custom
-inode operations on the synthetic inode instead of patched:
+Other SUSFS-adjacent behaviors are handled inside KernelSU:
 
-- `generic_fillattr`
-- `vfs_getattr`
-- `show_map_vma`
+- `/proc/cmdline` spoofing swaps the KSU-visible `saved_command_line` pointer
+  instead of patching proc entry source
+- `uname` spoofing reuses a KSU syscall hook instead of patching
+  `kernel/sys.c`
+- AVC spoofing reuses the existing KSU AVC path
+- delayed property hygiene restores BRENE-style resetprop coherence from a
+  kernel-owned post-boot retry window
 
-This works well for normal stat-style metadata. It also reduces the need for
-global stat hooks, though standalone `sus_kstat` still benefits from a small
-runtime compat layer for plain files that are not fronted by synthetic inodes.
+## Feature Coverage
 
-### 5. Keep KernelSU Integration Minimal
+### Implemented
 
-SUSFS still needs policy about who should see the stock view and who should see
-the SUSFS view.
+The current branch covers the following SUSFS-facing operations inside
+`KernelSU-Next`:
 
-This should stay inside `KernelSU-Next`, but the integration should be much
-smaller than the current patch set:
-
-- reuse KernelSU allowlist or app profile state
-- reuse current KSU process / uid policy
-- optionally keep a lightweight per-task "stock view" marker if still needed
-- keep the userspace control plane in KernelSU supercall or move to generic
-  netlink
-
-## Features That Can Become Mostly Hookless
-
-### Good Candidates
-
-- `sus_path`
-- `open_redirect`
-- `sus_kstat` for redirected or virtual entries
-
-These fit the NoMount pattern well because they are VFS object problems.
-
-### Partial Candidates
-
-- `sus_mount`
-- `spoof_cmdline_or_bootconfig`
-- `sus_kstat` for plain non-redirected files
-
-These may be moved away from kernel source patching by runtime hijacking procfs
-entry operations, `seq_operations`, or small post-VFS runtime hooks, but they
-are not as clean as VFS directory/file interception.
-
-### Poor Candidates For Full Hookless Conversion
-
-- `avc_log_spoofing`
-
-These touch global SELinux or proc/mm surfaces. They likely still need one of:
-
-- KSU runtime hooks
-- kprobes / kretprobes
-- tracepoints
-- function-table patching like KSU's LSM hook support
-
-`sus_map` was implemented on this branch through a KSU-owned proc/mm
-compatibility layer rather than through NoMount-style VFS virtualization. That
-is the intended model for the remaining global surfaces too: keep them small,
-localized, and owned by `KernelSU-Next`.
-
-## Practical End State
-
-The clean target is a hybrid model:
-
-1. NoMount-style object hijacking for path-facing SUSFS features.
-2. Small KSU runtime hooks only for the remaining global surfaces.
-
-That gives us:
-
-- no main-kernel source patching
-- far less kernel-version churn
-- most maintenance isolated inside `KernelSU-Next`
-
-## Suggested Migration Order
-
-### Phase 1
-
-Implement a KSU-hosted rule engine and NoMount-style parent directory hijacking
-for:
-
-- `sus_path`
-- `open_redirect`
-
-### Phase 2
-
-Fold `sus_kstat` into synthetic inode metadata for those same virtual entries.
-
-### Phase 3
-
-Add optional runtime hook helpers for:
-
-- proc maps
-- mountinfo / mountstat
-- uname
-- cmdline / bootconfig
-- AVC spoofing
-
-### Phase 4
-
-Delete the old `susfs4ksu/kernel_patches/50_add_*` style integration path once
-feature parity is good enough.
-
-## Key Tradeoff
-
-If we copy NoMount exactly, we will reduce maintenance fast, but we will also
-lose some of the current SUSFS global spoof surfaces unless we reintroduce them
-through a small runtime-hook layer inside `KernelSU-Next`.
-
-So the realistic goal is not "zero hooks anywhere".
-
-The realistic goal is:
-
-- zero main-kernel source patches
-- NoMount-style VFS hijack for path features
-- minimal KSU-owned runtime hooks for global proc/mm/SELinux surfaces
-
-## Current Branch Status
-
-The current `susfs-hookless` branch implements the KSU-hosted hookless layer
-inside `KernelSU-Next` only:
-
-- built-in default hide for `/product/overlay/LineageSDKOverlaySM8350.apk`
-  Note: this is seeded during SUSFS init as a safe default, based on the
-  runtime-tested DuckDetector case, so it does not rely on userspace rule
-  injection. The rule is retried again from the SUSFS boot-complete callback
-  so late-mounted product overlays still get picked up on devices where the
-  path is not present during early KernelSU init.
 - `add_sus_path`
 - `add_sus_path_loop`
 - `add_open_redirect`
 - `hide_sus_mnts_for_non_su_procs`
-  Note: the procfs mount/fdinfo compatibility view is now scoped to the same
-  umounted app/isolation UIDs as the rest of SUSFS. Root and zygote-side
-  readers keep the stock procfs implementation so ReZygisk, TreatWheel, and
-  similar tooling do not parse a rewritten mount view.
-  Mount-namespace identity is normalized separately through a KSU-owned
-  `mntns_get()` kretprobe so `/proc/*/ns/mnt`, `readlink()`, and namespace-fd
-  identity stay aligned with the visible main namespace for SUSFS-hidden app
-  readers.
 - `add_sus_kstat`
 - `update_sus_kstat`
 - `add_sus_kstat_statically`
-  Note: standalone `sus_kstat` is implemented with a `vfs_getattr_nosec()`
-  kretprobe plus runtime patches on the proc `maps` and `smaps`
-  `seq_operations.show` slots.
-  The patched show handlers only spoof output for the same umounted
-  app/isolation readers SUSFS is targeting; root and zygote-side readers fall
-  back to the kernel's original procfs logic.
 - `add_sus_map`
-  Note: standalone `sus_map` is implemented with KSU-owned runtime patches on
-  the proc `maps` and `smaps` `seq_operations.show` slots.
-  The broader hookless proc/mm wrappers for `/proc/*/smaps_rollup`,
-  `/proc/*/pagemap`, `map_files`, and `/proc/*/mem` are deliberately kept on
-  the stock kernel path for now, but the original BRENE-triggered
-  `add_sus_map` panic path has been fixed: current live-device replay of the
-  BRENE module's `sus_map` batch no longer reproduces the
-  `scheduling while atomic` crash.
 - `set_cmdline_or_bootconfig`
-  Note: this 5.4 target exposes `/proc/cmdline` but does not have
-  `/proc/bootconfig`, so the compat command maps to cmdline spoofing only.
-  The hookless implementation now swaps the kernel's `saved_command_line`
-  pointer from inside KernelSU-Next instead of patching the proc entry's
-  `single_show` callback at runtime.
 - `set_uname`
 - `enable_avc_log_spoofing`
 - compat reporting for `show_version`, `show_variant`, and
   `show_enabled_features`
 - delayed property hygiene for BRENE-style resetprop cleanup
-  Note: the kernel-owned KSU init-rc injection now captures a pre-module
-  baseline for
-  `ro.build.version.known_codenames` and
-  `ro.product.ab_ota_partitions`. The matching restore path is no longer
-  embedded in the appended init rc; instead `on_boot_completed()` schedules a
-  kernel-owned usermode helper retry window that deletes `ro.modversion`,
-  restores the tracked coherence props, and rebuilds the property areas after
-  asynchronous module scripts finish.
-  This keeps the flow kernel-side without requiring a manager refresh while
-  avoiding the init-rc parser regressions caused by embedding complex shell
-  parameter expansion directly into the appended rc blob.
 
-The implementation is intentionally scoped to built-in
-`CONFIG_KSU_KPROBES_SUSFS` on top of `CONFIG_KSU_KPROBES_HOOK` and works by:
+There is also a built-in default hide for
+`/product/overlay/LineageSDKOverlaySM8350.apk`, seeded from inside SUSFS init
+and retried again from the boot-complete path so late-mounted overlays are
+still covered.
 
-- storing SUSFS rules inside `KernelSU-Next`
-- hijacking only affected parent-directory `i_op.lookup`
-- hijacking only affected parent-directory `i_fop.iterate*`
-- proxying selected superblock operations for synthetic redirected inodes
-- patching procfs file-operation entry points at runtime for mount and fdinfo
-  views
-- using a `mntns_get()` kretprobe so mount-namespace symlink, path-follow, and
-  namespace-fd identity all converge on the same visible namespace for
-  SUSFS-hidden app readers
-- patching procfs `maps` and `smaps` `seq_operations.show` slots at runtime
-  for standalone `sus_kstat` dev:ino spoofing and `sus_map` hiding
-- replacing `/proc/cmdline` from inside KSU instead of patching proc source
-- using a KSU syscall hook for `uname` instead of patching `kernel/sys.c`
-- reusing the existing KSU AVC spoof feature instead of duplicating SELinux
-  patch logic
-- capturing the BRENE-oriented property baseline from KSU's injected init rc
-  and restoring it from a delayed kernel-owned usermode helper retry window
-  after `boot-completed`, so it stays kernel-side without depending on manager
-  updates
-- deferring SUSFS compat commands onto task work when running through
-  `CONFIG_KSU_KPROBES_HOOK`, so path resolution, mutexes, and user buffer
-  copies do not execute from the reboot kprobe's atomic pre-handler context
+### Partial or intentionally narrow
 
-For the proc/mm compatibility layer, the current implementation also assumes
-the target kernel exposes the needed procfs symbols through kallsyms. On this
-`lisa_kernel` tree that is a reasonable assumption because the arm64 defconfig
-already enables `CONFIG_KALLSYMS_ALL=y`.
+- `sus_map` currently targets `maps` and `smaps` only
+- `/proc/bootconfig` is not implemented on this Lisa 5.4 target because the
+  kernel exposes `/proc/cmdline` but not `/proc/bootconfig`
+- procfs rewriting is scoped to app and isolated readers that are already under
+  KSU's umount policy
 
-At this point the old SUSFS feature set from the main kernel patch path is
-mostly covered from inside `KernelSU-Next`, with the remaining complexity
-concentrated in the proc/mm compatibility layer instead of spread across
-multiple core kernel files. The one deliberate gap right now is the broader
-`sus_map` proc/mm surface, which is narrowed to `maps` and `smaps` until the
-live-device lockup on LSPosed preload mappings is fully root-caused.
-
-One live-device panic has now been root-caused: under
-`CONFIG_KSU_KPROBES_HOOK`, SUSFS compat commands originally ran directly from
-the `sys_reboot` kprobe pre-handler. Replaying BRENE's `add_sus_map` batch
-triggered `BUG: scheduling while atomic` from `ksu_susfs_handle_sus_map_compat`
-in that atomic context. The current branch fixes that by deferring SUSFS
-compat work to task work before returning to userspace.
-
-For compatibility, the procfs runtime layer is intentionally narrower than the
-old global kernel patch path. The hookless implementation only rewrites procfs
-views for the umounted app/isolation processes SUSFS is targeting, while
-zygote/root readers continue through the stock kernel code path.
-
-One legacy option is intentionally not ported as part of the hookless layer:
+### Not part of this branch
 
 - `CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS`
 
-That knob is about symbol visibility hardening rather than SUSFS feature
-coverage, so it is treated as separate future work instead of a blocker for the
-hookless migration.
+That knob is symbol-hardening work, not required for the hookless migration.
+
+## Safety Rules
+
+The hookless layer is intentionally conservative in a few places:
+
+- root and zygote-side readers keep the stock procfs path
+- SUSFS compat work is deferred out of atomic kprobe context
+- package-helper namespace joins only apply to app or isolated processes that
+  are already eligible for the KSU mount-hide view
+
+This is important for keeping ReZygisk, TreatWheel, manager state persistence,
+and module-side behavior stable.
+
+## Verified Status
+
+The current live-device validation on Lisa confirms:
+
+- TNG helper mount drift is fixed
+- the package main process and `:tools` helper now converge on the same mount
+  namespace
+- the kernel-side path no longer relies on main-kernel manual hooks
+- the earlier BRENE `sus_map` atomic-context crash path is fixed by deferring
+  compat work through task work
+
+One concrete live replay after the `unshare_fs_struct()` fix showed:
+
+- main process `my.com.tngdigital.ewallet` in `mnt:[4026534906]`
+- helper process `my.com.tngdigital.ewallet:tools` also in
+  `mnt:[4026534906]`
+
+That replay replaced the earlier failing behavior where the helper stayed in a
+different namespace and `setns(CLONE_NEWNS)` returned `-EINVAL` because the
+process still shared its `fs_struct`.
+
+## Configuration
+
+Enable SUSFS hookless with:
+
+- `CONFIG_KSU_KPROBES_HOOK=y`
+- `CONFIG_KSU_KPROBES_SUSFS=y`
+
+The hookless path is designed to work with kernel-side changes only. It does
+not require a separate manager-side migration to function.
+
+## Summary
+
+`susfs-hookless` keeps SUSFS inside `KernelSU-Next`, replaces the old broad
+main-kernel patch set with a mix of:
+
+- NoMount-style per-object VFS hijacking for path features
+- KSU-owned runtime instrumentation for proc/mm and namespace surfaces
+
+This is the intended long-term maintenance model for the Lisa target:
+
+- no generic-kernel manual hooks
+- no SUSFS files spread through the main tree
+- all feature work isolated inside `KernelSU-Next`

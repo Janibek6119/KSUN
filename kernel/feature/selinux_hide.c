@@ -70,6 +70,9 @@ static inline struct mutex *ksu_get_status_lock(void) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0) || defined(KSU_COMPAT_SELINUX_STATUS_VAR_IN_SELINUX_STATE)
     return &selinux_state.status_lock;
 #else
+    if (selinux_state.ss) {
+        return &selinux_state.ss->status_lock;
+    }
     if (!ksu_selinux_status_lock_ptr) {
         ksu_selinux_status_lock_ptr = (struct mutex *)find_kernel_symbol_exact("selinux_status_lock");
     }
@@ -81,6 +84,9 @@ static inline struct page *ksu_get_status_page(void) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0) || defined(KSU_COMPAT_SELINUX_STATUS_VAR_IN_SELINUX_STATE)
     return selinux_state.status_page;
 #else
+    if (selinux_state.ss) {
+        return selinux_state.ss->status_page;
+    }
     if (!ksu_selinux_status_page_ptr) {
         ksu_selinux_status_page_ptr = (struct page **)find_kernel_symbol_exact("selinux_status_page");
     }
@@ -188,6 +194,70 @@ static bool ksu_context_type_is_any(const char *ctx, const char * const *types,
     }
 
     return false;
+}
+
+static const char *ksu_context_type_bounded(const char *ctx, size_t ctx_len,
+                                            size_t *type_len)
+{
+    const char *type;
+    const char *end;
+    const char *limit;
+
+    if (!ctx || !ctx_len) return NULL;
+
+    limit = ctx + ctx_len;
+    type = memchr(ctx, ':', ctx_len);
+    if (!type || type + 1 >= limit) return NULL;
+
+    type = memchr(type + 1, ':', limit - (type + 1));
+    if (!type || type + 1 >= limit) return NULL;
+    type++;
+
+    end = memchr(type, ':', limit - type);
+    if (!end) end = limit;
+
+    *type_len = (size_t)(end - type);
+    return type;
+}
+
+static bool ksu_context_type_is_bounded(const char *ctx, size_t ctx_len,
+                                        const char *type_name)
+{
+    size_t type_len;
+    const char *type = ksu_context_type_bounded(ctx, ctx_len, &type_len);
+
+    return type && strlen(type_name) == type_len &&
+           !strncmp(type, type_name, type_len);
+}
+
+static bool ksu_context_type_is_any_bounded(const char *ctx, size_t ctx_len,
+                                            const char * const *types,
+                                            size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (ksu_context_type_is_bounded(ctx, ctx_len, types[i])) return true;
+    }
+
+    return false;
+}
+
+static bool ksu_hide_should_mask_context(const char *ctx, size_t ctx_len)
+{
+    static const char * const hidden_types[] = {
+        "adbroot",
+        "ksu",
+        "ksu_file",
+        "lsposed_file",
+        "magisk",
+        "magisk_file",
+        "xposed_data",
+        "xposed_file",
+    };
+
+    return ksu_context_type_is_any_bounded(ctx, ctx_len, hidden_types,
+                                           ARRAY_SIZE(hidden_types));
 }
 
 static bool ksu_hide_class_is(struct policydb *db, u16 tclass,
@@ -303,6 +373,37 @@ static void ksu_hide_filter_access_decision(struct av_decision *avd,
                                     app_query_sources,
                                     ARRAY_SIZE(app_query_sources),
                                     "lsposed_file", "file", "read");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "dex2oat",
+                        "dex2oat_exec", "file", "execute_no_trans");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "kernel",
+                        "adb_data_file", "file", "read");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "kernel",
+                        "tmpfs", "fifo_file", "open");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "rootfs",
+                        "tmpfs", "filesystem", "associate");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "shell",
+                        "su", "process", "transition");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "system_server",
+                        "apk_data_file", "file", "execute");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "zygote",
+                        "adb_data_file", "dir", "search");
+}
+
+static void ksu_hide_sanitize_status(struct selinux_kernel_status *status)
+{
+    if (!status) return;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+    status->policyload = KSU_SELINUX_POLICYLOAD_SEQNO;
+    status->sequence = 4;
+#else
+    status->policyload = 0;
+    status->sequence = 0;
+#endif
+
+    if (ksu_late_loaded && !status->enforcing) {
+        status->enforcing = 1;
+    }
 }
 
 static void initialize_fake_status(void)
@@ -323,42 +424,40 @@ static void initialize_fake_status(void)
 
     struct selinux_kernel_status *new_status = page_address(new_page);
     memcpy(new_status, status, sizeof(*status));
-
-    new_status->policyload = KSU_SELINUX_POLICYLOAD_SEQNO;
-    new_status->sequence = 4;
-
-    if (ksu_late_loaded && !new_status->enforcing) {
-        new_status->enforcing = 1;
-    }
+    ksu_hide_sanitize_status(new_status);
 
     fake_status = new_page;
 out:
     mutex_unlock(status_lock);
 }
 
+static struct page *ksu_selinux_hide_status_page_for_current(void)
+{
+    if (unlikely(current_uid().val < 10000) || !ksu_selinux_hide_enabled) {
+        return NULL;
+    }
+
+    if (!READ_ONCE(fake_status)) {
+        initialize_fake_status();
+    }
+
+    return READ_ONCE(fake_status);
+}
+
 typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
+typedef ssize_t (*sel_read_handle_status_fn)(struct file *filp,
+                                             char __user *buf,
+                                             size_t count, loff_t *ppos);
 static sel_open_handle_status_fn orig_sel_open_handle_status, *sel_open_handle_status_slot;
+static sel_read_handle_status_fn orig_sel_read_handle_status, *sel_read_handle_status_slot;
 
 static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
 {
-    if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
-        struct mutex *status_lock = ksu_get_status_lock();
-        void *data;
+    struct page *data = ksu_selinux_hide_status_page_for_current();
 
-        if (!fake_status) {
-            initialize_fake_status();
-        }
-
-        if (status_lock) {
-            mutex_lock(status_lock);
-            data = fake_status;
-            mutex_unlock(status_lock);
-
-            if (data) {
-                filp->private_data = data;
-                return 0;
-            }
-        }
+    if (data) {
+        filp->private_data = data;
+        return 0;
     }
 
     int ret = orig_sel_open_handle_status(inode, filp);
@@ -368,10 +467,23 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
     return ret;
 }
 
-static void hook_selinux_status_open(void)
+static ssize_t my_sel_read_handle_status(struct file *filp, char __user *buf,
+                                         size_t count, loff_t *ppos)
 {
-    if (orig_sel_open_handle_status) return;
-    if (!sel_open_handle_status_slot) {
+    struct page *status = ksu_selinux_hide_status_page_for_current();
+
+    if (status) {
+        return simple_read_from_buffer(buf, count, ppos,
+                                       page_address(status),
+                                       sizeof(struct selinux_kernel_status));
+    }
+
+    return orig_sel_read_handle_status(filp, buf, count, ppos);
+}
+
+static void hook_selinux_status(void)
+{
+    if (!sel_open_handle_status_slot || !sel_read_handle_status_slot) {
 #ifdef CONFIG_KALLSYMS_ALL
         struct file_operations *ops = (struct file_operations *)find_kernel_symbol_exact("sel_handle_status_ops");
 #else
@@ -383,14 +495,35 @@ static void hook_selinux_status_open(void)
             return;
         }
         sel_open_handle_status_slot = &ops->open;
+        sel_read_handle_status_slot = &ops->read;
     }
-    
-    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;
-    orig_sel_open_handle_status = *sel_open_handle_status_slot;
-    int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
-    if (ret) {
-        pr_err("selinux_hide: patch sel_open_handle_status err: %d\n", ret);
-        orig_sel_open_handle_status = NULL;
+
+    if (!orig_sel_open_handle_status) {
+        sel_open_handle_status_fn new_open = my_sel_open_handle_status;
+        int ret;
+
+        orig_sel_open_handle_status = *sel_open_handle_status_slot;
+        ret = ksu_patch_text(sel_open_handle_status_slot, &new_open,
+                             sizeof(new_open),
+                             KSU_PATCH_TEXT_FLUSH_DCACHE);
+        if (ret) {
+            pr_err("selinux_hide: patch sel_open_handle_status err: %d\n", ret);
+            orig_sel_open_handle_status = NULL;
+        }
+    }
+
+    if (!orig_sel_read_handle_status) {
+        sel_read_handle_status_fn new_read = my_sel_read_handle_status;
+        int ret;
+
+        orig_sel_read_handle_status = *sel_read_handle_status_slot;
+        ret = ksu_patch_text(sel_read_handle_status_slot, &new_read,
+                             sizeof(new_read),
+                             KSU_PATCH_TEXT_FLUSH_DCACHE);
+        if (ret) {
+            pr_err("selinux_hide: patch sel_read_handle_status err: %d\n", ret);
+            orig_sel_read_handle_status = NULL;
+        }
     }
 }
 
@@ -399,6 +532,11 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
     if (likely(current_uid().val < 10000)) {
         return orig_context_write(file, buf, size);
     }
+
+    if (ksu_hide_should_mask_context(buf, size)) {
+        return -EINVAL;
+    }
+
     char *canon = NULL;
     u32 sid, len;
     ssize_t length;
@@ -467,6 +605,11 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
 
     length = -EINVAL;
     if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3) goto out;
+    if (ksu_hide_should_mask_context(scon, strlen(scon)) ||
+        ksu_hide_should_mask_context(tcon, strlen(tcon))) {
+        length = -EINVAL;
+        goto out;
+    }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
     length = security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL);
@@ -544,6 +687,11 @@ int __nocfi ksu_handle_selinux_setprocattr(struct task_struct *p, char *name, vo
             str[size - 1] = 0;
             size--;
         }
+
+        if (ksu_hide_should_mask_context(str, size)) {
+            return -EINVAL;
+        }
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
         error = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL);
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)
@@ -583,6 +731,22 @@ static void hook_legacy_setprocattr(void)
 static void ksu_selinux_hide_unhook(void)
 {
     int ret;
+    if (orig_sel_read_handle_status && sel_read_handle_status_slot) {
+        ret = ksu_patch_text(sel_read_handle_status_slot,
+                             &orig_sel_read_handle_status,
+                             sizeof(orig_sel_read_handle_status),
+                             KSU_PATCH_TEXT_FLUSH_DCACHE);
+        if (ret) pr_err("selinux_hide: exit: patch_text sel_read_handle_status err: %d\n", ret);
+        orig_sel_read_handle_status = NULL;
+    }
+    if (orig_sel_open_handle_status && sel_open_handle_status_slot) {
+        ret = ksu_patch_text(sel_open_handle_status_slot,
+                             &orig_sel_open_handle_status,
+                             sizeof(orig_sel_open_handle_status),
+                             KSU_PATCH_TEXT_FLUSH_DCACHE);
+        if (ret) pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
+        orig_sel_open_handle_status = NULL;
+    }
     if (orig_context_write) {
         ret = ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
         if (ret) pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
@@ -623,7 +787,7 @@ static int ksu_selinux_hide_enable(void)
     if (!backup_policydb || !backup_sidtab) return -EAGAIN;
 #endif
 
-    hook_selinux_status_open();
+    hook_selinux_status();
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) && !defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)

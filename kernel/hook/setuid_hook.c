@@ -20,6 +20,9 @@
 #include "supercall/supercall.h"
 #include "hook/tp_marker.h"
 #include "feature/kernel_umount.h"
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+#include "susfs/procfs.h"
+#endif
 
 extern void disable_seccomp();
 
@@ -72,6 +75,10 @@ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
         return 0;
     }
 #endif // #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+    ksu_susfs_handle_setuid(old_uid, new_uid);
+#endif
 
     // Handle kernel umount
     ksu_handle_umount(old_uid, new_uid);

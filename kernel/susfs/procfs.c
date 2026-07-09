@@ -4,15 +4,19 @@
 #include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/init_task.h>
+#include <linux/jhash.h>
 #include <linux/jiffies.h>
 #include <linux/jump_label.h>
 #include <linux/kmod.h>
 #include <linux/kprobes.h>
+#include <linux/mm.h>
 #include <linux/mnt_namespace.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/nsproxy.h>
+#include <linux/sched/signal.h>
 #include <linux/proc_fs.h>
+#include <linux/proc_ns.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/security.h>
@@ -21,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <linux/utsname.h>
 #include <linux/version.h>
@@ -35,6 +40,7 @@
 #include "arch.h"
 #include "hook/patch_memory.h"
 #include "hook/syscall_hook.h"
+#include "infra/su_mount_ns.h"
 #include "infra/symbol_resolver.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
@@ -51,6 +57,10 @@
 #define KSU_SUSFS_PROP_HYGIENE_INITIAL_DELAY_MS 1000
 #define KSU_SUSFS_PROP_HYGIENE_RETRY_DELAY_MS 5000
 #define KSU_SUSFS_PROP_HYGIENE_MAX_ATTEMPTS 6
+#define KSU_SUSFS_ISOLATED_NS_RETRY_DELAY_MS 25
+#define KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS 16
+#define KSU_SUSFS_ISOLATED_NS_MAX_CMDLINE 256
+#define KSU_SUSFS_ISOLATED_NS_MAX_CANDIDATES 64
 
 extern const struct file_operations proc_mounts_operations;
 extern const struct file_operations proc_mountinfo_operations;
@@ -59,6 +69,13 @@ extern const struct file_operations proc_mountstats_operations;
 struct ksu_susfs_hidden_mount {
 	struct hlist_node node;
 	struct mount *mnt;
+};
+
+struct ksu_susfs_pkg_anchor {
+	struct hlist_node node;
+	struct task_struct *task;
+	uid_t user_id;
+	char pkg[KSU_SUSFS_MAX_PATHNAME];
 };
 
 struct ksu_susfs_vfs_create_mount_ctx {
@@ -70,8 +87,17 @@ struct ksu_susfs_clone_mnt_ctx {
 	bool hide;
 };
 
+struct ksu_susfs_isolated_ns_ctx {
+	struct delayed_work work;
+	struct callback_head cb;
+	struct task_struct *task;
+	unsigned int attempts;
+};
+
 static DEFINE_HASHTABLE(ksu_susfs_hidden_mounts, KSU_SUSFS_MOUNT_HASH_BITS);
 static DEFINE_SPINLOCK(ksu_susfs_hidden_mounts_lock);
+static DEFINE_HASHTABLE(ksu_susfs_pkg_anchors, KSU_SUSFS_MOUNT_HASH_BITS);
+static DEFINE_MUTEX(ksu_susfs_pkg_anchors_lock);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_mount_hide_enabled);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_cmdline_spoof_enabled);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_uname_spoof_enabled);
@@ -111,6 +137,7 @@ static unsigned int ksu_susfs_prop_hygiene_attempts;
 static void ksu_susfs_cmdline_retry_fn(struct work_struct *work);
 static void ksu_susfs_mount_window_retry_fn(struct work_struct *work);
 static void ksu_susfs_prop_hygiene_restore_fn(struct work_struct *work);
+static bool ksu_susfs_pkg_ns_allowed_uid(uid_t uid);
 static DECLARE_DELAYED_WORK(ksu_susfs_cmdline_retry_work,
 			    ksu_susfs_cmdline_retry_fn);
 static DECLARE_DELAYED_WORK(ksu_susfs_mount_window_retry_work,
@@ -182,9 +209,458 @@ static void ksu_susfs_prop_hygiene_restore_fn(struct work_struct *work)
 	pr_info("susfs: prop hygiene restore complete\n");
 }
 
+static int ksu_susfs_get_cmdline0(struct task_struct *task, char *buf,
+				       size_t buf_size)
+{
+	int len;
+	size_t nul;
+
+	if (!task || !buf || buf_size < 2) {
+		return -EINVAL;
+	}
+
+	len = get_cmdline(task, buf, buf_size - 1);
+	if (len <= 0) {
+		return -ENOENT;
+	}
+
+	buf[len] = '\0';
+	nul = strnlen(buf, len);
+	if (!nul) {
+		return -ENOENT;
+	}
+
+	return (int)nul;
+}
+
+static int ksu_susfs_match_pkg_cmdline(const char *cmdline0, const char *pkg)
+{
+	size_t len;
+
+	if (!cmdline0 || !pkg) {
+		return 0;
+	}
+
+	len = strlen(pkg);
+	if (!len) {
+		return 0;
+	}
+
+	if (!strcmp(cmdline0, pkg)) {
+		return 3;
+	}
+	if (!strncmp(cmdline0, pkg, len) && cmdline0[len] == ':') {
+		return 2;
+	}
+
+	return 0;
+}
+
+static int ksu_susfs_parse_package_name(const char *cmdline0, char *pkg,
+					 size_t pkg_size)
+{
+	const char *sep;
+	size_t len;
+
+	if (!cmdline0 || !*cmdline0 || !pkg || pkg_size < 2) {
+		return -EINVAL;
+	}
+
+	sep = strchr(cmdline0, ':');
+	if (!sep) {
+		sep = cmdline0 + strlen(cmdline0);
+	}
+
+	len = sep - cmdline0;
+	if (!len || len >= pkg_size || !memchr(cmdline0, '.', len)) {
+		return -ENOENT;
+	}
+
+	memcpy(pkg, cmdline0, len);
+	pkg[len] = '\0';
+	return 0;
+}
+
+static bool ksu_susfs_pkg_data_path_exists(uid_t uid, const char *pkg)
+{
+	char path[KSU_SUSFS_MAX_PATHNAME];
+	struct path real_path;
+	const struct cred *saved;
+	int user_id;
+	int err;
+
+	if (!pkg || !*pkg) {
+		return false;
+	}
+
+	user_id = uid / PER_USER_RANGE;
+	err = scnprintf(path, sizeof(path), "/data/user/%d/%s", user_id, pkg);
+	if (err <= 0 || err >= sizeof(path)) {
+		return false;
+	}
+
+	saved = override_creds(ksu_cred);
+	err = kern_path(path, LOOKUP_FOLLOW, &real_path);
+	revert_creds(saved);
+	if (err) {
+		return false;
+	}
+
+	path_put(&real_path);
+	return true;
+}
+
+static u32 ksu_susfs_pkg_anchor_key(const char *pkg, uid_t user_id)
+{
+	return jhash(pkg, strlen(pkg), user_id);
+}
+
+static struct ksu_susfs_pkg_anchor *
+ksu_susfs_find_pkg_anchor_locked(const char *pkg, uid_t user_id)
+{
+	struct ksu_susfs_pkg_anchor *entry;
+	u32 key;
+
+	if (!pkg || !*pkg) {
+		return NULL;
+	}
+
+	key = ksu_susfs_pkg_anchor_key(pkg, user_id);
+	hash_for_each_possible(ksu_susfs_pkg_anchors, entry, node, key) {
+		if (entry->user_id == user_id && !strcmp(entry->pkg, pkg)) {
+			return entry;
+		}
+	}
+
+	return NULL;
+}
+
+static bool ksu_susfs_pkg_anchor_task_dead(struct task_struct *task)
+{
+	return !task || !pid_alive(task) ||
+	       (READ_ONCE(task->flags) & PF_EXITING);
+}
+
+static void ksu_susfs_drop_pkg_anchor_locked(struct ksu_susfs_pkg_anchor *entry)
+{
+	struct task_struct *task;
+
+	if (!entry) {
+		return;
+	}
+
+	hash_del(&entry->node);
+	task = entry->task;
+	entry->task = NULL;
+	kfree(entry);
+	if (task) {
+		put_task_struct(task);
+	}
+}
+
+static struct task_struct *ksu_susfs_get_pkg_anchor_task(const char *pkg,
+							 uid_t user_id)
+{
+	struct ksu_susfs_pkg_anchor *entry;
+	struct task_struct *task = NULL;
+
+	mutex_lock(&ksu_susfs_pkg_anchors_lock);
+	entry = ksu_susfs_find_pkg_anchor_locked(pkg, user_id);
+	if (entry && !ksu_susfs_pkg_anchor_task_dead(entry->task)) {
+		task = entry->task;
+		get_task_struct(task);
+	} else if (entry) {
+		ksu_susfs_drop_pkg_anchor_locked(entry);
+	}
+	mutex_unlock(&ksu_susfs_pkg_anchors_lock);
+
+	return task;
+}
+
+static void ksu_susfs_store_pkg_anchor_task(const char *pkg, uid_t user_id,
+					    struct task_struct *task)
+{
+	struct ksu_susfs_pkg_anchor *entry;
+	struct task_struct *anchor;
+	struct task_struct *old_task = NULL;
+
+	if (!pkg || !*pkg || !task) {
+		return;
+	}
+
+	anchor = task->group_leader ? task->group_leader : task;
+	get_task_struct(anchor);
+
+	mutex_lock(&ksu_susfs_pkg_anchors_lock);
+	entry = ksu_susfs_find_pkg_anchor_locked(pkg, user_id);
+	if (entry) {
+		old_task = entry->task;
+		entry->task = anchor;
+	} else {
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		if (!entry) {
+			mutex_unlock(&ksu_susfs_pkg_anchors_lock);
+			put_task_struct(anchor);
+			return;
+		}
+		entry->task = anchor;
+		entry->user_id = user_id;
+		strscpy(entry->pkg, pkg, sizeof(entry->pkg));
+		hash_add(ksu_susfs_pkg_anchors, &entry->node,
+			 ksu_susfs_pkg_anchor_key(pkg, user_id));
+	}
+	mutex_unlock(&ksu_susfs_pkg_anchors_lock);
+
+	if (old_task) {
+		put_task_struct(old_task);
+	}
+}
+
+static void ksu_susfs_clear_pkg_anchors_all(void)
+{
+	struct ksu_susfs_pkg_anchor *entry;
+	struct hlist_node *tmp;
+	int bkt;
+
+	mutex_lock(&ksu_susfs_pkg_anchors_lock);
+	hash_for_each_safe(ksu_susfs_pkg_anchors, bkt, tmp, entry, node) {
+		ksu_susfs_drop_pkg_anchor_locked(entry);
+	}
+	mutex_unlock(&ksu_susfs_pkg_anchors_lock);
+}
+
+static struct task_struct *ksu_susfs_find_mount_donor(const char *pkg, uid_t uid)
+{
+	struct task_struct *candidates[KSU_SUSFS_ISOLATED_NS_MAX_CANDIDATES];
+	struct task_struct *task;
+	struct task_struct *best = NULL;
+	char cmdline0[KSU_SUSFS_ISOLATED_NS_MAX_CMDLINE];
+	uid_t user_id = uid / PER_USER_RANGE;
+	int best_rank = 0;
+	int nr = 0;
+	int i;
+
+	read_lock(&tasklist_lock);
+	for_each_process (task) {
+		uid_t task_uid_val = task_uid(task).val;
+
+		if (task == current || nr >= ARRAY_SIZE(candidates)) {
+			continue;
+		}
+		if (!task->mm || !is_appuid(task_uid_val)) {
+			continue;
+		}
+		if ((task_uid_val / PER_USER_RANGE) != user_id) {
+			continue;
+		}
+
+		get_task_struct(task);
+		candidates[nr++] = task;
+	}
+	read_unlock(&tasklist_lock);
+
+	for (i = 0; i < nr; i++) {
+		struct task_struct *candidate = candidates[i];
+		int len = ksu_susfs_get_cmdline0(candidate, cmdline0,
+						 sizeof(cmdline0));
+		int rank = 0;
+		bool keep = false;
+
+		if (len > 0) {
+			rank = ksu_susfs_match_pkg_cmdline(cmdline0, pkg);
+			if (rank > best_rank) {
+				best = candidate;
+				best_rank = rank;
+				keep = true;
+			} else if (candidate == best) {
+				keep = true;
+			}
+		}
+
+		if (!keep) {
+			put_task_struct(candidate);
+			candidates[i] = NULL;
+		}
+	}
+
+	for (i = 0; i < nr; i++) {
+		if (candidates[i] && candidates[i] != best) {
+			put_task_struct(candidates[i]);
+		}
+	}
+
+	return best;
+}
+
+static void ksu_susfs_free_isolated_ns_ctx(struct ksu_susfs_isolated_ns_ctx *ctx)
+{
+	if (ctx->task) {
+		put_task_struct(ctx->task);
+		ctx->task = NULL;
+	}
+	kfree(ctx);
+}
+
+static int ksu_susfs_queue_isolated_ns_task_work(struct ksu_susfs_isolated_ns_ctx *ctx)
+{
+	if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS) {
+		return -EAGAIN;
+	}
+
+	ctx->attempts++;
+	return task_work_add(ctx->task, &ctx->cb, TWA_RESUME);
+}
+
+static void ksu_susfs_schedule_isolated_ns_retry(struct ksu_susfs_isolated_ns_ctx *ctx,
+						 unsigned long delay_ms)
+{
+	if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS) {
+		ksu_susfs_free_isolated_ns_ctx(ctx);
+		return;
+	}
+
+	mod_delayed_work(system_wq, &ctx->work, msecs_to_jiffies(delay_ms));
+}
+
+static void ksu_susfs_isolated_ns_cb(struct callback_head *cb)
+{
+	struct ksu_susfs_isolated_ns_ctx *ctx =
+		container_of(cb, struct ksu_susfs_isolated_ns_ctx, cb);
+	struct task_struct *donor;
+	char cmdline0[KSU_SUSFS_ISOLATED_NS_MAX_CMDLINE];
+	char pkg[KSU_SUSFS_MAX_PATHNAME];
+	uid_t uid;
+	uid_t user_id;
+	unsigned int old_ns = 0;
+	unsigned int donor_ns = 0;
+	bool path_ok = false;
+	bool exact_pkg;
+	int err;
+
+	if (unlikely(in_interrupt() || oops_in_progress)) {
+		ksu_susfs_free_isolated_ns_ctx(ctx);
+		return;
+	}
+
+	uid = current_uid().val;
+	if (!ksu_susfs_pkg_ns_allowed_uid(uid) || !current->mm ||
+	    !current->nsproxy ||
+	    !current->nsproxy->mnt_ns) {
+		ksu_susfs_free_isolated_ns_ctx(ctx);
+		return;
+	}
+
+	if (ksu_susfs_get_cmdline0(current, cmdline0, sizeof(cmdline0)) <= 0 ||
+	    ksu_susfs_parse_package_name(cmdline0, pkg, sizeof(pkg))) {
+		if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS) {
+			pr_warn("susfs: pkgns pid=%d uid=%u failed to resolve package cmdline after %u attempts\n",
+				current->pid, uid, ctx->attempts);
+			ksu_susfs_free_isolated_ns_ctx(ctx);
+			return;
+		}
+		ksu_susfs_schedule_isolated_ns_retry(
+			ctx, KSU_SUSFS_ISOLATED_NS_RETRY_DELAY_MS);
+		return;
+	}
+
+	user_id = uid / PER_USER_RANGE;
+	exact_pkg = !strcmp(cmdline0, pkg);
+	old_ns = current->nsproxy->mnt_ns->ns.inum;
+	path_ok = ksu_susfs_pkg_data_path_exists(uid, pkg);
+
+	if (exact_pkg) {
+		ksu_susfs_store_pkg_anchor_task(pkg, user_id, current);
+		ksu_susfs_free_isolated_ns_ctx(ctx);
+		return;
+	}
+
+	donor = ksu_susfs_get_pkg_anchor_task(pkg, user_id);
+	if (!donor) {
+		donor = ksu_susfs_find_mount_donor(pkg, uid);
+	}
+	if (!donor) {
+		if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS &&
+		    is_appuid(uid) && path_ok) {
+			ksu_susfs_store_pkg_anchor_task(pkg, user_id, current);
+			ksu_susfs_free_isolated_ns_ctx(ctx);
+			return;
+		}
+		if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS) {
+			pr_warn("susfs: pkgns pid=%d uid=%u found no donor for %s after %u attempts\n",
+				current->pid, uid, pkg, ctx->attempts);
+			ksu_susfs_free_isolated_ns_ctx(ctx);
+			return;
+		}
+		ksu_susfs_schedule_isolated_ns_retry(
+			ctx, KSU_SUSFS_ISOLATED_NS_RETRY_DELAY_MS);
+		return;
+	}
+
+	if (donor->nsproxy && donor->nsproxy->mnt_ns) {
+		donor_ns = donor->nsproxy->mnt_ns->ns.inum;
+	}
+
+	if (donor_ns && donor_ns == old_ns && path_ok) {
+		put_task_struct(donor);
+		ksu_susfs_free_isolated_ns_ctx(ctx);
+		return;
+	}
+
+	err = ksu_join_task_mount_ns(donor);
+	put_task_struct(donor);
+	path_ok = ksu_susfs_pkg_data_path_exists(uid, pkg);
+	if (err || !path_ok) {
+		if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS) {
+			pr_warn("susfs: pkgns pid=%d uid=%u failed to join mount ns for %s after %u attempts (err=%d current=%u donor=%u path=%d)\n",
+				current->pid, uid, pkg, ctx->attempts, err,
+				old_ns, donor_ns, path_ok);
+			ksu_susfs_free_isolated_ns_ctx(ctx);
+			return;
+		}
+		ksu_susfs_schedule_isolated_ns_retry(
+			ctx, KSU_SUSFS_ISOLATED_NS_RETRY_DELAY_MS);
+		return;
+	}
+
+	ksu_susfs_free_isolated_ns_ctx(ctx);
+}
+
+static void ksu_susfs_isolated_ns_work_fn(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct ksu_susfs_isolated_ns_ctx *ctx =
+		container_of(dwork, struct ksu_susfs_isolated_ns_ctx, work);
+
+	if (!ctx->task || !pid_alive(ctx->task) ||
+	    (READ_ONCE(ctx->task->flags) & PF_EXITING)) {
+		ksu_susfs_free_isolated_ns_ctx(ctx);
+		return;
+	}
+
+	if (ksu_susfs_queue_isolated_ns_task_work(ctx)) {
+		if (ctx->attempts >= KSU_SUSFS_ISOLATED_NS_MAX_ATTEMPTS) {
+			pr_warn("susfs: pkgns task_work add failed for pid=%d after %u attempts\n",
+				task_pid_nr(ctx->task), ctx->attempts);
+			ksu_susfs_free_isolated_ns_ctx(ctx);
+			return;
+		}
+		ksu_susfs_schedule_isolated_ns_retry(
+			ctx, KSU_SUSFS_ISOLATED_NS_RETRY_DELAY_MS);
+	}
+}
+
 static bool ksu_susfs_compat_root_allowed(void)
 {
 	return current_uid().val == 0 || is_ksu_domain();
+}
+
+static bool ksu_susfs_pkg_ns_allowed_uid(uid_t uid)
+{
+	if (is_isolated_process(uid)) {
+		return true;
+	}
+
+	return is_appuid(uid) && ksu_uid_should_umount(uid);
 }
 
 static bool ksu_susfs_mount_view_allowed_current(void)
@@ -201,6 +677,21 @@ static bool ksu_susfs_mount_view_allowed_current(void)
 	uid = current_uid().val;
 	return (is_appuid(uid) || is_isolated_process(uid)) &&
 	       ksu_uid_should_umount(uid);
+}
+
+static bool ksu_susfs_mntns_identity_view_enabled(void)
+{
+	uid_t uid;
+
+	if (unlikely(in_interrupt() || oops_in_progress)) {
+		return false;
+	}
+	if (unlikely(current->flags & (PF_KTHREAD | PF_EXITING))) {
+		return false;
+	}
+
+	uid = current_uid().val;
+	return ksu_susfs_pkg_ns_allowed_uid(uid);
 }
 
 static bool ksu_susfs_mount_hidden_exact(struct mount *mnt)
@@ -496,7 +987,7 @@ static int ksu_susfs_mntns_get_handler(struct kretprobe_instance *ri,
 	struct ns_common *orig_ns;
 	struct mnt_namespace *visible_ns;
 
-	if (!ksu_susfs_mount_hide_view_enabled()) {
+	if (!ksu_susfs_mntns_identity_view_enabled()) {
 		return 0;
 	}
 
@@ -925,6 +1416,33 @@ static void ksu_susfs_destroy_kprobe(struct kprobe **kp_ptr)
 	*kp_ptr = NULL;
 }
 
+void ksu_susfs_handle_setuid(uid_t old_uid, uid_t new_uid)
+{
+	struct ksu_susfs_isolated_ns_ctx *ctx;
+
+	if (old_uid == new_uid || !ksu_susfs_pkg_ns_allowed_uid(new_uid)) {
+		return;
+	}
+	if (unlikely(in_interrupt() || oops_in_progress)) {
+		return;
+	}
+	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+	if (!ctx) {
+		return;
+	}
+
+	INIT_DELAYED_WORK(&ctx->work, ksu_susfs_isolated_ns_work_fn);
+	ctx->cb.func = ksu_susfs_isolated_ns_cb;
+	ctx->task = current;
+	get_task_struct(ctx->task);
+	if (ksu_susfs_queue_isolated_ns_task_work(ctx)) {
+		pr_warn("susfs: pkgns immediate task_work add failed for pid=%d\n",
+			current->pid);
+		ksu_susfs_schedule_isolated_ns_retry(
+			ctx, KSU_SUSFS_ISOLATED_NS_RETRY_DELAY_MS);
+	}
+}
+
 static void ksu_susfs_mount_runtime_disable(void)
 {
 	ksu_susfs_restore_fop_open(&proc_mounts_operations,
@@ -945,6 +1463,7 @@ static void ksu_susfs_mount_runtime_disable(void)
 	ksu_susfs_destroy_kprobe(&ksu_susfs_cleanup_mnt_kp);
 	cancel_delayed_work_sync(&ksu_susfs_mount_window_retry_work);
 	ksu_susfs_mount_clear_hidden_all();
+	ksu_susfs_clear_pkg_anchors_all();
 	ksu_susfs_orig_show_mounts = NULL;
 	ksu_susfs_orig_show_mountinfo = NULL;
 	ksu_susfs_orig_show_mountstats = NULL;

@@ -48,18 +48,27 @@ static long ksu_sys_setns(int fd, int flags)
 #endif
 }
 
-// global mode , need CAP_SYS_ADMIN and CAP_SYS_CHROOT to perform setns
-static void ksu_mnt_ns_global(void)
+static long ksu_mnt_ns_setns_task(struct task_struct *task)
 {
-    // save current working directory as absolute path before setns
     char *pwd_path = NULL;
-    char *pwd_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+    char *pwd_buf;
+    struct path saved_pwd;
+    struct path ns_path;
+    struct file *ns_file;
+    long ret;
+    int fd;
+
+    if (unlikely(!task)) {
+        return -EINVAL;
+    }
+
+    // save current working directory as absolute path before setns
+    pwd_buf = kmalloc(PATH_MAX, GFP_KERNEL);
     if (!pwd_buf) {
         pr_warn("no mem for pwd buffer, skip restore pwd!!\n");
         goto try_setns;
     }
 
-    struct path saved_pwd;
     get_fs_pwd(current->fs, &saved_pwd);
     pwd_path = d_path(&saved_pwd, pwd_buf, PATH_MAX);
     path_put(&saved_pwd);
@@ -75,44 +84,27 @@ static void ksu_mnt_ns_global(void)
     }
 
 try_setns:
-
-    rcu_read_lock();
-    // &init_task is not init, but swapper/idle, which forks the init process
-    // so we need find init process
-    struct pid *pid_struct = find_pid_ns(1, &init_pid_ns);
-    if (unlikely(!pid_struct)) {
-        rcu_read_unlock();
-        pr_warn("failed to find pid_struct for PID 1\n");
-        goto out;
-    }
-
-    struct task_struct *pid1_task = get_pid_task(pid_struct, PIDTYPE_PID);
-    rcu_read_unlock();
-    if (unlikely(!pid1_task)) {
-        pr_warn("failed to get task_struct for PID 1\n");
-        goto out;
-    }
-    struct path ns_path;
-    long ret = ns_get_path(&ns_path, pid1_task, &mntns_operations);
-    put_task_struct(pid1_task);
+    ret = ns_get_path(&ns_path, task, &mntns_operations);
     if (ret) {
-        pr_warn("failed get path for init mount namespace: %ld\n", ret);
-        goto out;
+        pr_warn("failed get path for target mount namespace: %ld\n", ret);
+        goto out_free;
     }
-    struct file *ns_file = dentry_open(&ns_path, O_RDONLY, ksu_cred);
+    ns_file = dentry_open(&ns_path, O_RDONLY, ksu_cred);
 
     path_put(&ns_path);
     if (IS_ERR(ns_file)) {
-        pr_warn("failed open file for init mount namespace: %ld\n",
+        pr_warn("failed open file for target mount namespace: %ld\n",
                 PTR_ERR(ns_file));
-        goto out;
+        ret = PTR_ERR(ns_file);
+        goto out_free;
     }
 
-    int fd = get_unused_fd_flags(O_CLOEXEC);
+    fd = get_unused_fd_flags(O_CLOEXEC);
     if (fd < 0) {
         pr_warn("failed to get an unused fd: %d\n", fd);
         fput(ns_file);
-        goto out;
+        ret = fd;
+        goto out_free;
     }
 
     fd_install(fd, ns_file);
@@ -121,8 +113,7 @@ try_setns:
     ksu_close_fd(fd);
 
     if (ret) {
-        pr_warn("call setns failed: %ld\n", ret);
-        goto out;
+        goto out_free;
     }
     // try to restore working directory using absolute path after setns
     if (pwd_path) {
@@ -135,8 +126,31 @@ try_setns:
             pr_warn("restore pwd failed: %d, path: %s\n", err, pwd_path);
         }
     }
-out:
+
+out_free:
     kfree(pwd_buf);
+    return ret;
+}
+
+// global mode , need CAP_SYS_ADMIN and CAP_SYS_CHROOT to perform setns
+static void ksu_mnt_ns_global(void)
+{
+    struct task_struct *pid1_task;
+
+    rcu_read_lock();
+    // &init_task is not init, but swapper/idle, which forks the init process
+    // so we need find init process
+    pid1_task = get_pid_task(find_vpid(1), PIDTYPE_PID);
+    rcu_read_unlock();
+    if (unlikely(!pid1_task)) {
+        pr_warn("failed to get task_struct for PID 1\n");
+        return;
+    }
+
+    if (ksu_mnt_ns_setns_task(pid1_task)) {
+        pr_warn("failed to join init mount namespace\n");
+    }
+    put_task_struct(pid1_task);
 }
 
 // individual mode , need CAP_SYS_ADMIN to perform unshare and remount
@@ -180,4 +194,27 @@ void setup_mount_ns(int32_t ns_mode)
         ksu_mnt_ns_individual();
     }
     revert_creds(old_cred);
+}
+
+int ksu_join_task_mount_ns(struct task_struct *task)
+{
+    const struct cred *old_cred;
+    long ret;
+
+    if (!task) {
+        return -EINVAL;
+    }
+
+    if (current->fs && current->fs->users != 1) {
+        ret = unshare_fs_struct();
+        if (ret) {
+            pr_warn("failed to unshare fs before setns: %ld\n", ret);
+            return (int)ret;
+        }
+    }
+
+    old_cred = override_creds(ksu_cred);
+    ret = ksu_mnt_ns_setns_task(task);
+    revert_creds(old_cred);
+    return ret ? (int)ret : 0;
 }
