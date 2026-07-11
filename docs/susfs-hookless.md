@@ -15,6 +15,18 @@ On the Lisa kernel tree, `drivers/kernelsu` resolves to
 existing KernelSU build path without adding new `fs/` or `include/` files to
 the main kernel tree.
 
+## Origins
+
+This implementation was inspired by two prior directions:
+
+- the branch-hack approach used in `backslashxx/KernelSU`
+- the hookless runtime design explored in NoMount's
+  `experimental/hookless` branch
+
+The current `susfs-hookless` port is not a direct copy of either project, but
+it follows the same general maintenance goal: keep main-kernel patching to a
+minimum and move feature logic into a smaller runtime-owned layer.
+
 ## Goal
 
 The goal is not "zero hooks anywhere".
