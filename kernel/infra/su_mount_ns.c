@@ -8,11 +8,15 @@
 #include <linux/namei.h>
 #include <linux/proc_ns.h>
 #include <linux/pid.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/task.h>
+#else
+#include <linux/sched.h>
+#endif
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/task_work.h>
-#include <linux/version.h>
 #include <uapi/linux/mount.h>
 
 #include "arch.h"
@@ -25,7 +29,7 @@ extern int path_mount(const char *dev_name, struct path *path,
                       const char *type_page, unsigned long flags,
                       void *data_page);
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(KSU_ARM64_HAS_PTREGS_SYSCALL)
 extern long __arm64_sys_setns(const struct pt_regs *regs);
 #elif defined(__x86_64__)
 extern long __x64_sys_setns(const struct pt_regs *regs);
@@ -33,14 +37,20 @@ extern long __x64_sys_setns(const struct pt_regs *regs);
 
 static long ksu_sys_setns(int fd, int flags)
 {
+#if (defined(__aarch64__) && defined(KSU_ARM64_HAS_PTREGS_SYSCALL)) || \
+	defined(__x86_64__)
     struct pt_regs regs;
+
     memset(&regs, 0, sizeof(regs));
 
     PT_REGS_PARM1(&regs) = fd;
     PT_REGS_PARM2(&regs) = flags;
+#endif
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(KSU_ARM64_HAS_PTREGS_SYSCALL)
     return __arm64_sys_setns(&regs);
+#elif defined(__aarch64__)
+    return sys_setns(fd, flags);
 #elif defined(__x86_64__)
     return __x64_sys_setns(&regs);
 #else
@@ -156,9 +166,13 @@ static void ksu_mnt_ns_global(void)
 // individual mode , need CAP_SYS_ADMIN to perform unshare and remount
 static void ksu_mnt_ns_individual(void)
 {
+#ifdef KSU_HAS_KSYS_UNSHARE
     long ret = ksys_unshare(CLONE_NEWNS);
+#else
+    long ret = sys_unshare(CLONE_NEWNS);
+#endif
     if (ret) {
-        pr_warn("call ksys_unshare failed: %ld\n", ret);
+        pr_warn("unshare mount namespace failed: %ld\n", ret);
         return;
     }
 

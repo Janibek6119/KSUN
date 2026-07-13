@@ -580,22 +580,24 @@ void ksu_execve_hook_ksud(const struct pt_regs *regs)
     ksu_handle_execveat_ksud(path, &argv);
 }
 
-static long (*orig_sys_read)(const struct pt_regs *regs);
-static long ksu_sys_read(const struct pt_regs *regs)
+static syscall_fn_t orig_sys_read;
+static long ksu_sys_read(KSU_SYSCALL_WRAPPER_ARGS)
 {
-    unsigned int fd = PT_REGS_PARM1(regs);
-    char __user **buf_ptr = (char __user **)&PT_REGS_PARM2(regs);
-    size_t *count_ptr = (size_t *)&PT_REGS_PARM3(regs);
+    const struct pt_regs *call_regs = KSU_SYSCALL_WRAPPER_REGS();
+    unsigned int fd = PT_REGS_PARM1(call_regs);
+    char __user **buf_ptr = (char __user **)&PT_REGS_PARM2(call_regs);
+    size_t *count_ptr = (size_t *)&PT_REGS_PARM3(call_regs);
 
     ksu_handle_sys_read(fd, buf_ptr, count_ptr);
-    return orig_sys_read(regs);
+    return ksu_invoke_syscall(orig_sys_read, call_regs);
 }
 
-static long (*orig_sys_fstat)(const struct pt_regs *regs);
-static long ksu_sys_fstat(const struct pt_regs *regs)
+static syscall_fn_t orig_sys_fstat;
+static long ksu_sys_fstat(KSU_SYSCALL_WRAPPER_ARGS)
 {
-    unsigned int fd = PT_REGS_PARM1(regs);
-    void __user *statbuf = (void __user *)PT_REGS_PARM2(regs);
+    const struct pt_regs *call_regs = KSU_SYSCALL_WRAPPER_REGS();
+    unsigned int fd = PT_REGS_PARM1(call_regs);
+    void __user *statbuf = (void __user *)PT_REGS_PARM2(call_regs);
     bool is_rc = false;
     long ret;
 
@@ -609,7 +611,7 @@ static long ksu_sys_fstat(const struct pt_regs *regs)
         fput(file);
     }
 
-    ret = orig_sys_fstat(regs);
+    ret = ksu_invoke_syscall(orig_sys_fstat, call_regs);
 
     if (is_rc) {
         void __user *st_size_ptr = statbuf + offsetof(struct stat, st_size);

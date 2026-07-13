@@ -3,6 +3,8 @@
 
 #include <linux/printk.h>
 
+#include "compiler_compat.h"
+
 #ifdef pr_fmt
 #undef pr_fmt
 #define pr_fmt(fmt) "KernelSU: " fmt

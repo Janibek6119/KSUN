@@ -716,7 +716,11 @@ static void hook_legacy_setprocattr(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
     struct security_hook_list *hp;
+#ifdef KSU_LSM_HOOKS_USE_HLIST
     hlist_for_each_entry(hp, &security_hook_heads.setprocattr, list) {
+#else
+    list_for_each_entry(hp, &security_hook_heads.setprocattr, list) {
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
         if (strcmp("selinux", hp->lsm)) continue;
 #endif
@@ -763,7 +767,11 @@ static void ksu_selinux_hide_unhook(void)
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
     if (ksu_orig_setprocattr) {
         struct security_hook_list *hp;
+#ifdef KSU_LSM_HOOKS_USE_HLIST
         hlist_for_each_entry(hp, &security_hook_heads.setprocattr, list) {
+#else
+        list_for_each_entry(hp, &security_hook_heads.setprocattr, list) {
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
             if (strcmp("selinux", hp->lsm)) continue;
 #endif

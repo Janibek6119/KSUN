@@ -1,7 +1,6 @@
 #include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
-#include <linux/overflow.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -110,7 +109,11 @@ int ksu_event_queue_push(struct ksu_event_queue *queue, __u16 type, __u16 flags,
         return -EINVAL;
     }
 
-    node = kmalloc(struct_size(node, payload, len), gfp);
+    if ((size_t)len > (size_t)-1 - sizeof(*node)) {
+        return -EOVERFLOW;
+    }
+
+    node = kmalloc(sizeof(*node) + len, gfp);
 
     if (node) {
         INIT_LIST_HEAD(&node->list);

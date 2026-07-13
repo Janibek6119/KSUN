@@ -125,7 +125,11 @@ static int __init ksu_find_ni_syscall_slots(int *out_slots, int max_slots)
     if (!ksu_syscall_table || max_slots <= 0)
         return 0;
 
-    ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook("__arm64_sys_ni_syscall");
+    ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook(
+        "__arm64_sys_ni_syscall");
+    if (!ni_syscall)
+        ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook(
+            "sys_ni_syscall");
 
     pr_info("sys_ni_syscall: 0x%lx\n", ni_syscall);
 
@@ -145,12 +149,14 @@ static int __init ksu_find_ni_syscall_slots(int *out_slots, int max_slots)
 // Unified dispatcher: reads original NR from x8/orig_ax, dispatches to handler.
 // Validates that syscallno matches our dispatcher slot (i.e. we redirected it),
 // otherwise it's a spurious call — return -ENOSYS.
-static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
+static long __nocfi ksu_dispatch_syscall(const struct pt_regs *regs)
 {
+    int orig_nr;
+
     if (regs->syscallno != ksu_dispatcher_nr)
         return -ENOSYS;
 
-    int orig_nr = (int)PT_REGS_ORIG_SYSCALL(regs);
+    orig_nr = (int)PT_REGS_ORIG_SYSCALL(regs);
 
     if (regs->syscallno == orig_nr)
         return -ENOSYS;
@@ -166,6 +172,11 @@ static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
     }
 
     return -ENOSYS;
+}
+
+static long __nocfi ksu_syscall_dispatcher(KSU_SYSCALL_WRAPPER_ARGS)
+{
+    return ksu_dispatch_syscall(KSU_SYSCALL_WRAPPER_REGS());
 }
 
 // Register a handler into the dispatcher's routing table.

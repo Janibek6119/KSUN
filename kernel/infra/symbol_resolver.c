@@ -3,6 +3,7 @@
 #include <linux/string.h>
 #include <linux/version.h>
 
+#include "compiler_compat.h"
 #include "infra/symbol_resolver.h"
 
 // https://github.com/torvalds/linux/commit/89245600941e4e0f87d77f60ee269b5e61ef4e49

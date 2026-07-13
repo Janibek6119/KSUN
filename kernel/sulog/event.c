@@ -3,13 +3,16 @@
 #include <linux/cred.h>
 #include <linux/gfp.h>
 #include <linux/kernel.h>
-#include <linux/overflow.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/signal.h>
+#else
+#include <linux/sched.h>
+#endif
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
-#include <linux/version.h>
 #if defined(__x86_64__) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
 #include <linux/mm.h>
 #endif
@@ -312,9 +315,7 @@ static struct ksu_sulog_pending_event *ksu_sulog_capture(__u16 event_type, const
     event->filename_len = filename_len;
     event->argv_len = argv_len;
 
-    if (check_add_overflow((__u32)sizeof(*event), filename_len, &payload_len) ||
-        check_add_overflow(payload_len, argv_len, &payload_len))
-        goto out_free_payload;
+    payload_len = (__u32)sizeof(*event) + filename_len + argv_len;
 
     pending->event_type = event_type;
     pending->payload = payload;

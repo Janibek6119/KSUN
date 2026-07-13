@@ -1,5 +1,37 @@
 kernelsu-objs := core/init.o
 
+# Android vendor trees frequently backport syscall wrappers and LSM layout
+# changes without updating LINUX_VERSION_CODE. Keep these probes global because
+# the Kprobes backend needs them even when SUSFS itself is disabled.
+ifeq ($(CONFIG_ARM64),y)
+ifeq ($(shell grep -Fq "syscall_fn_t" \
+	$(srctree)/arch/arm64/include/asm/syscall.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_ARM64_HAS_PTREGS_SYSCALL
+endif
+ifeq ($(shell grep -F "syscall_fn_t" \
+	$(srctree)/arch/arm64/include/asm/syscall.h 2>/dev/null | \
+	grep -Fq "const struct pt_regs"; echo $$?),0)
+ccflags-y += -DKSU_ARM64_PTREGS_SYSCALL_CONST
+endif
+endif
+ifeq ($(shell grep -Eq \
+	'struct[[:space:]]+hlist_node[[:space:]]+list[[:space:]]*;' \
+	$(srctree)/include/linux/lsm_hooks.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_LSM_HOOKS_USE_HLIST
+endif
+ifeq ($(shell grep -q "ksys_close" \
+	$(srctree)/include/linux/syscalls.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_HAS_KSYS_CLOSE
+endif
+ifeq ($(shell grep -q "ksys_unshare" \
+	$(srctree)/include/linux/syscalls.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_HAS_KSYS_UNSHARE
+endif
+ifeq ($(shell grep -Fq "extern int close_fd" \
+	$(srctree)/include/linux/fdtable.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_HAS_CLOSE_FD
+endif
+
 kernelsu-objs += compat/kernel_compat.o
 
 kernelsu-objs += feature/kernel_umount.o
@@ -67,6 +99,111 @@ ifeq ($(CONFIG_KSU_KPROBES_SUSFS),y)
 kernelsu-objs += susfs/core.o
 kernelsu-objs += susfs/kstat.o
 kernelsu-objs += susfs/procfs.o
+
+# SUSFS is built against Android kernels that frequently backport individual
+# MM/VFS APIs without updating LINUX_VERSION_CODE. Probe the actual source
+# surface instead of assuming that a nominal kernel version has every API from
+# the matching upstream release.
+ifeq ($(shell grep -Eq \
+	'struct[[:space:]]+maple_tree[[:space:]]+mm_mt[[:space:]]*;' \
+	$(srctree)/include/linux/mm_types.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_MM_MT
+endif
+ifeq ($(shell grep -q "mmap_read_lock_killable" \
+	$(wildcard $(srctree)/include/linux/mmap_lock.h \
+		$(srctree)/include/linux/mm.h) \
+	2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_MMAP_LOCK
+endif
+ifeq ($(shell grep -q "down_read_killable" \
+	$(srctree)/include/linux/rwsem.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_DOWN_READ_KILLABLE
+endif
+ifeq ($(shell grep -q "mmget_not_zero" \
+	$(wildcard $(srctree)/include/linux/sched/mm.h \
+		$(srctree)/include/linux/sched.h) 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_MMGET_NOT_ZERO
+endif
+ifneq ($(wildcard $(srctree)/include/linux/sched/mm.h),)
+ccflags-y += -DKSU_SUSFS_HAS_SCHED_MM
+endif
+ifeq ($(shell grep -q "show_map_pad_vma" \
+	$(srctree)/include/linux/pgsize_migration.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_PGSIZE_MIGRATION
+endif
+ifeq ($(shell grep -q "vma_get_anon_name" \
+	$(wildcard $(srctree)/include/linux/mm_types.h \
+		$(srctree)/include/linux/mm.h) \
+	2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_VMA_ANON_NAME
+endif
+ifeq ($(shell grep -F "get_user_pages_remote" \
+	$(srctree)/include/linux/mm.h 2>/dev/null | \
+	grep -Fq "struct task_struct"; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_GUP_REMOTE_HAS_TASK
+endif
+ifeq ($(shell grep -Fq 'struct vm_area_struct **vmas' \
+	$(srctree)/include/linux/mm.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_GUP_REMOTE_HAS_VMAS
+endif
+ifeq ($(shell grep -Fq "**vmas, int *locked" \
+	$(srctree)/include/linux/mm.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_GUP_REMOTE_HAS_LOCKED
+endif
+ifeq ($(shell grep -q "page_is_young" \
+	$(srctree)/include/linux/page_idle.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_PAGE_IDLE
+endif
+ifeq ($(shell grep -q "xa_is_value" \
+	$(srctree)/include/linux/xarray.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_XA_IS_VALUE
+endif
+ifeq ($(shell grep -q "seq_put_hex_ll" \
+	$(srctree)/include/linux/seq_file.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_SEQ_PUT_HEX_LL
+endif
+ifeq ($(shell grep -q "seq_put_decimal_ull_width" \
+	$(srctree)/include/linux/seq_file.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_SEQ_PUT_DECIMAL_ULL_WIDTH
+endif
+ifeq ($(shell grep -q "struct mm_walk_ops" \
+	$(wildcard $(srctree)/include/linux/pagewalk.h \
+		$(srctree)/include/linux/mm.h) \
+	2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_MM_WALK_OPS
+endif
+ifeq ($(shell grep -q "compound_nr" \
+	$(srctree)/include/linux/mm.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_COMPOUND_NR
+endif
+ifeq ($(shell grep -q "hugetlb_pmd_shared" \
+	$(srctree)/include/linux/hugetlb.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_HUGETLB_PMD_SHARED
+endif
+ifeq ($(shell grep -q "is_device_private_entry" \
+	$(srctree)/include/linux/swapops.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
+endif
+ifneq ($(wildcard $(srctree)/include/linux/generic-radix-tree.h),)
+ccflags-y += -DKSU_SUSFS_HAS_GENERIC_RADIX_TREE
+endif
+ifeq ($(shell grep -q "proc_pid_smaps_rollup_operations" \
+	$(srctree)/fs/proc/internal.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_SMAPS_ROLLUP
+endif
+ifeq ($(shell grep -E '[*]getattr[^_[:alnum:]]' \
+	$(srctree)/include/linux/fs.h 2>/dev/null | \
+	grep -Fq "struct path"; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_PATH_GETATTR
+endif
+ifeq ($(shell grep -Eq '[*]iterate_shared[^_[:alnum:]]' \
+	$(srctree)/include/linux/fs.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_ITERATE_SHARED
+endif
+ifeq ($(shell grep -Eq '[*]iterate[^_[:alnum:]]' \
+	$(srctree)/include/linux/fs.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_ITERATE
+endif
 endif
 
 ifdef KBUILD_EXTMOD

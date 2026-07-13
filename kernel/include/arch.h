@@ -3,6 +3,10 @@
 
 #include <linux/version.h>
 
+#ifndef untagged_addr
+#define untagged_addr(addr) (addr)
+#endif
+
 #if defined(__aarch64__)
 
 #define __PT_PARM1_REG regs[0]
@@ -19,7 +23,7 @@
 #define __PT_IP_REG pc
 #define __PT_ORIG_SYSCALL_REG regs[8]
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
+#ifdef KSU_ARM64_HAS_PTREGS_SYSCALL
 #define REBOOT_SYMBOL "__arm64_sys_reboot"
 #define SYS_READ_SYMBOL "__arm64_sys_read"
 #define SYS_EXECVE_SYMBOL "__arm64_sys_execve"
@@ -89,7 +93,10 @@
 #define PT_REGS_IP(x) (__PT_REGS_CAST(x)->__PT_IP_REG)
 #define PT_REGS_ORIG_SYSCALL(x) (__PT_REGS_CAST(x)->__PT_ORIG_SYSCALL_REG)
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
+#if defined(__aarch64__) && defined(KSU_ARM64_HAS_PTREGS_SYSCALL)
+#define PT_REAL_REGS(regs) ((struct pt_regs *)PT_REGS_PARM1(regs))
+#elif defined(__x86_64__) && \
+	LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
 #define PT_REAL_REGS(regs) ((struct pt_regs *)PT_REGS_PARM1(regs))
 #else
 #define PT_REAL_REGS(regs) ((regs))

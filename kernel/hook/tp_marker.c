@@ -3,8 +3,12 @@
 #include "linux/cred.h"
 #include <linux/spinlock.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
+#else
+#include <linux/sched.h>
+#endif
 
 #include "policy/allowlist.h"
 #include "klog.h" // IWYU pragma: keep

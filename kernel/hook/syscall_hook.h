@@ -2,8 +2,16 @@
 #define __KSU_H_KSU_SYSCALL_HOOK
 #include <asm/syscall.h>
 
+#include "arch.h"
+
 #if defined(__x86_64__)
 typedef sys_call_ptr_t syscall_fn_t;
+#elif defined(__aarch64__) && !defined(KSU_ARM64_HAS_PTREGS_SYSCALL)
+#include <asm/processor.h>
+#include <linux/sched.h>
+
+typedef long (*syscall_fn_t)(unsigned long, unsigned long, unsigned long,
+			     unsigned long, unsigned long, unsigned long);
 #endif
 
 extern syscall_fn_t *ksu_syscall_table;
@@ -11,10 +19,43 @@ extern syscall_fn_t *ksu_syscall_table;
 // Dispatcher slot number in syscall table
 extern int ksu_dispatcher_nr;
 
+#if defined(__aarch64__) && !defined(KSU_ARM64_HAS_PTREGS_SYSCALL)
+#define KSU_SYSCALL_WRAPPER_ARGS \
+	unsigned long arg0, unsigned long arg1, unsigned long arg2, \
+	unsigned long arg3, unsigned long arg4, unsigned long arg5
+#define KSU_SYSCALL_WRAPPER_REGS() task_pt_regs(current)
+#elif defined(__aarch64__) && !defined(KSU_ARM64_PTREGS_SYSCALL_CONST)
+#define KSU_SYSCALL_WRAPPER_ARGS struct pt_regs *regs
+#define KSU_SYSCALL_WRAPPER_REGS() regs
+#else
+#define KSU_SYSCALL_WRAPPER_ARGS const struct pt_regs *regs
+#define KSU_SYSCALL_WRAPPER_REGS() regs
+#endif
+
+static inline long ksu_invoke_syscall(syscall_fn_t fn,
+				      const struct pt_regs *regs)
+{
+#if defined(__aarch64__) && !defined(KSU_ARM64_HAS_PTREGS_SYSCALL)
+	return fn(PT_REGS_PARM1(regs), PT_REGS_PARM2(regs),
+		  PT_REGS_PARM3(regs), PT_REGS_SYSCALL_PARM4(regs),
+		  PT_REGS_PARM5(regs), PT_REGS_PARM6(regs));
+#elif defined(__aarch64__) && !defined(KSU_ARM64_PTREGS_SYSCALL_CONST)
+	return fn((struct pt_regs *)regs);
+#else
+	return fn(regs);
+#endif
+}
+
+static inline long ksu_invoke_syscall_nr(int nr,
+					 const struct pt_regs *regs)
+{
+	return ksu_invoke_syscall(ksu_syscall_table[nr], regs);
+}
+
 // Syscall hook handler type.
 // orig_nr: the original syscall number before redirection
 // regs: the original pt_regs from userspace
-// Handler is responsible for calling ksu_syscall_table[orig_nr](regs) if needed.
+// Handler is responsible for calling ksu_invoke_syscall_nr() if needed.
 typedef long (*ksu_syscall_hook_fn)(int orig_nr, const struct pt_regs *regs);
 
 // --- Dispatcher-based hook API (register/unregister) ---

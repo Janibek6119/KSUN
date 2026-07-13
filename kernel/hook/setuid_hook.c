@@ -6,7 +6,9 @@
 #include <linux/seccomp.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/signal.h>
+#endif
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>

@@ -5,10 +5,12 @@
 #include <linux/version.h>
 #include <linux/syscalls.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#ifdef KSU_HAS_CLOSE_FD
 #define ksu_close_fd close_fd
-#else
+#elif defined(KSU_HAS_KSYS_CLOSE)
 #define ksu_close_fd ksys_close
+#else
+#define ksu_close_fd sys_close
 #endif
 
 #endif
