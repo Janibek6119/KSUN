@@ -19,9 +19,10 @@ the main kernel tree.
 
 This implementation was inspired by two prior directions:
 
-- the branch-hack approach used in `backslashxx/KernelSU`
-- the hookless runtime design explored in NoMount's
-  `experimental/hookless` branch
+- the branch-hack approach used in
+  [`backslashxx/KernelSU`](https://github.com/backslashxx/KernelSU)
+- the hookless runtime design explored in
+  [NoMount's `experimental/hookless` branch](https://github.com/maxsteeel/nomount/tree/experimental/hookless)
 
 The current `susfs-hookless` port is not a direct copy of either project, but
 it follows the same general maintenance goal: keep main-kernel patching to a
@@ -243,6 +244,42 @@ Enable SUSFS hookless with:
 
 The hookless path is designed to work with kernel-side changes only. It does
 not require a separate manager-side migration to function.
+
+## Kernel Compatibility
+
+The SUSFS build does not infer MM and VFS capabilities from
+`LINUX_VERSION_CODE` alone. Android vendor kernels often backport only part of
+a newer subsystem, so `kernel/Kbuild` probes the source tree and selects the
+matching implementation at compile time.
+
+The compatibility layer covers:
+
+- maple-tree and legacy linked-list VMA traversal
+- `mmap_lock` and legacy `mmap_sem` locking
+- modern `mm_walk_ops` and legacy embedded `mm_walk` callbacks
+- generic-radix and flex-array storage for `/proc/<pid>/map_files`
+- kernels with and without VMA anonymous names and 16K page-size padding
+- both `iterate_shared` and legacy `iterate` directory operations
+- pre-4.11 VFS `getattr` and kernels without `smaps_rollup`
+- const, mutable, and legacy raw-argument ARM64 syscall-table entries
+- hlist-based and older list-based LSM hook chains
+- kernels with and without Android's `__nocfi` compiler annotation
+
+Stock-style ARM64 4.19 and 5.4 trees are the primary legacy compatibility
+targets. The 4.19 lower bound matches the proven range of the branch-link work
+used as a design reference, although this implementation keeps KernelSU-Next's
+dispatcher and does not copy the experimental callsite scanner.
+
+Linux 4.9 is the lower best-effort source boundary. Its linked-list VMAs, old
+page walker, flex arrays, raw-argument syscall table, and list-based LSM hooks
+have compatibility paths, but this combination is not live-device validated.
+The target must still provide Kprobes, kretprobes, syscall tracepoints, procfs,
+and the Android vendor interfaces required by `CONFIG_KSU_KPROBES_HOOK`.
+
+Linux 3.10 and 3.18 are not supported by hookless SUSFS. They predate several
+required VFS and KernelSU hook interfaces; supporting them would amount to a
+separate infrastructure backport rather than a maintainable compatibility
+layer.
 
 ## Summary
 
