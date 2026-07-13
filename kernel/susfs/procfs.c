@@ -1,4 +1,5 @@
 #include <linux/cred.h>
+#include <linux/version.h>
 #include <linux/fdtable.h>
 #include <linux/fs.h>
 #include <linux/hashtable.h>
@@ -14,7 +15,9 @@
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/nsproxy.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/signal.h>
+#endif
 #include <linux/proc_fs.h>
 #include <linux/proc_ns.h>
 #include <linux/ptrace.h>
@@ -28,7 +31,6 @@
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <linux/utsname.h>
-#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include <asm/unistd.h>
@@ -38,6 +40,7 @@
 #include "proc/fd.h"
 
 #include "arch.h"
+#include "compat/kernel_compat.h"
 #include "hook/patch_memory.h"
 #include "hook/syscall_hook.h"
 #include "infra/su_mount_ns.h"
@@ -48,6 +51,7 @@
 #include "policy/feature.h"
 #include "runtime/ksud_boot.h"
 #include "selinux/selinux.h"
+#include "susfs/compat.h"
 #include "susfs/procfs.h"
 #include "susfs/susfs.h"
 
@@ -1656,7 +1660,7 @@ static long __nocfi ksu_susfs_hook_uname(int orig_nr, const struct pt_regs *regs
 		(struct new_utsname __user *)PT_REGS_PARM1(regs);
 	long ret;
 
-	ret = ksu_syscall_table[orig_nr](regs);
+	ret = ksu_invoke_syscall_nr(orig_nr, regs);
 	if (ret || !static_branch_unlikely(&ksu_susfs_uname_spoof_enabled)) {
 		return ret;
 	}

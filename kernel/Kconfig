@@ -53,7 +53,9 @@ config KSU_KPROBES_HOOK
 	default y if !KSU_MANUAL_HOOK
 	help
 	  Enable KPROBES, KRETPROBES and TRACEPOINT hook for KernelSU core.
-	  This should not be used on kernel below 5.10.
+	  ARM64 syscall and LSM layouts are selected from the target headers.
+	  Kernels below 5.10 still require the dependencies above and should be
+	  validated on the target device.
 
 config KSU_KPROBES_SUSFS
 	bool "KernelSU hookless SUSFS"
@@ -64,6 +66,10 @@ config KSU_KPROBES_SUSFS
 	  KernelSU-Next. This keeps SUSFS out of the main kernel tree and
 	  relies on KSU-owned VFS/procfs/syscall runtime hooks instead of
 	  per-version source patching.
+	  MM and VFS compatibility is selected from the APIs present in the
+	  source tree. Stock-style 4.19 and 5.4 ARM64 kernels are the primary
+	  legacy targets; 4.9 is best-effort when all Kprobes, syscall
+	  tracepoint, procfs, and Android vendor dependencies are present.
 	  Supported on this branch:
 	  - sus_path / add_sus_path
 	  - sus_path_loop / add_sus_path_loop

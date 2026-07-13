@@ -21,6 +21,19 @@
 #define KSU_SUSFS_IDMAP_CALL
 #endif
 
+#ifdef KSU_SUSFS_HAS_PATH_GETATTR
+#define KSU_SUSFS_GETATTR_ARGS \
+	KSU_SUSFS_IDMAP_ARG const struct path *path, struct kstat *stat, \
+	u32 request_mask, unsigned int query_flags
+#define KSU_SUSFS_GETATTR_DENTRY path->dentry
+#define KSU_SUSFS_GETATTR_PREP() do { } while (0)
+#else
+#define KSU_SUSFS_GETATTR_ARGS \
+	struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat
+#define KSU_SUSFS_GETATTR_DENTRY dentry
+#define KSU_SUSFS_GETATTR_PREP() ((void)mnt)
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 #define KSU_SUSFS_ACTOR_RET bool
 #define KSU_SUSFS_ACTOR_CONTINUE true

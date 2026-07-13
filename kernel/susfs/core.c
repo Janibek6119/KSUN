@@ -25,8 +25,9 @@
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
 #include "policy/allowlist.h"
-#include "susfs/kstat.h"
 #include "selinux/selinux.h"
+#include "susfs/compat.h"
+#include "susfs/kstat.h"
 #include "susfs/procfs.h"
 #include "susfs/susfs.h"
 
@@ -430,6 +431,23 @@ static int ksu_susfs_dir_release(struct inode *inode, struct file *file)
 	return ret;
 }
 
+static int ksu_susfs_call_iterate(const struct file_operations *fops,
+				  struct file *file,
+				  struct dir_context *ctx)
+{
+#ifdef KSU_SUSFS_HAS_ITERATE_SHARED
+	if (fops->iterate_shared) {
+		return fops->iterate_shared(file, ctx);
+	}
+#endif
+#ifdef KSU_SUSFS_HAS_ITERATE
+	if (fops->iterate) {
+		return fops->iterate(file, ctx);
+	}
+#endif
+	return -ENOTDIR;
+}
+
 static int ksu_susfs_dir_iterate_shared(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
@@ -438,21 +456,14 @@ static int ksu_susfs_dir_iterate_shared(struct file *file, struct dir_context *c
 
 	if (backend_inode && backend_inode->i_fop) {
 		file->f_inode = backend_inode;
-		if (backend_inode->i_fop->iterate_shared) {
-			ret = backend_inode->i_fop->iterate_shared(file, ctx);
-		}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-		else if (backend_inode->i_fop->iterate) {
-			ret = backend_inode->i_fop->iterate(file, ctx);
-		}
-#endif
+		ret = ksu_susfs_call_iterate(backend_inode->i_fop, file, ctx);
 		file->f_inode = inode;
 	}
 
 	return ret;
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#ifdef KSU_SUSFS_HAS_ITERATE
 static int ksu_susfs_dir_iterate(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
@@ -474,12 +485,14 @@ static const struct file_operations ksu_susfs_file_fops = {
 	.open = ksu_susfs_file_open,
 };
 
-static int ksu_susfs_file_getattr(KSU_SUSFS_IDMAP_ARG const struct path *path,
-				  struct kstat *stat, u32 request_mask,
-				  unsigned int query_flags)
+static int ksu_susfs_file_getattr(KSU_SUSFS_GETATTR_ARGS)
 {
-	struct inode *v_inode = d_backing_inode(path->dentry);
-	struct inode *backend_inode = ksu_susfs_backend_inode(v_inode);
+	struct inode *v_inode;
+	struct inode *backend_inode;
+
+	KSU_SUSFS_GETATTR_PREP();
+	v_inode = d_backing_inode(KSU_SUSFS_GETATTR_DENTRY);
+	backend_inode = ksu_susfs_backend_inode(v_inode);
 
 	if (!backend_inode) {
 		return -EIO;
@@ -658,8 +671,10 @@ static const struct file_operations ksu_susfs_dir_fops = {
 	.release = ksu_susfs_dir_release,
 	.llseek = generic_file_llseek,
 	.read = generic_read_dir,
+#ifdef KSU_SUSFS_HAS_ITERATE_SHARED
 	.iterate_shared = ksu_susfs_dir_iterate_shared,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#endif
+#ifdef KSU_SUSFS_HAS_ITERATE
 	.iterate = ksu_susfs_dir_iterate,
 #endif
 };
@@ -837,35 +852,19 @@ static int ksu_susfs_hijacked_iterate_shared(struct file *file,
 	proxy_ctx.orig_ctx = ctx;
 	proxy_ctx.parent = wrapped->parent;
 
-	if (wrapped->orig_fop->iterate_shared) {
-		int ret = wrapped->orig_fop->iterate_shared(file, &proxy_ctx.ctx);
+	{
+		int ret = ksu_susfs_call_iterate(wrapped->orig_fop, file,
+						 &proxy_ctx.ctx);
 
 		ctx->pos = proxy_ctx.ctx.pos;
 		return ret;
 	}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-	if (wrapped->orig_fop->iterate) {
-		int ret = wrapped->orig_fop->iterate(file, &proxy_ctx.ctx);
-
-		ctx->pos = proxy_ctx.ctx.pos;
-		return ret;
-	}
-#endif
-	return -ENOTDIR;
 
 do_real_iterate:
-	if (wrapped->orig_fop->iterate_shared) {
-		return wrapped->orig_fop->iterate_shared(file, ctx);
-	}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-	if (wrapped->orig_fop->iterate) {
-		return wrapped->orig_fop->iterate(file, ctx);
-	}
-#endif
-	return -ENOTDIR;
+	return ksu_susfs_call_iterate(wrapped->orig_fop, file, ctx);
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#ifdef KSU_SUSFS_HAS_ITERATE
 static int ksu_susfs_hijacked_iterate(struct file *file, struct dir_context *ctx)
 {
 	return ksu_susfs_hijacked_iterate_shared(file, ctx);
@@ -1202,12 +1201,18 @@ static int ksu_susfs_hijack_parent_inode(struct ksu_susfs_parent *parent,
 		wrapped_fop->signature = KSU_SUSFS_SIGNATURE;
 		wrapped_fop->parent = parent;
 
+#ifdef KSU_SUSFS_HAS_ITERATE_SHARED
 		if (wrapped_fop->fake_fop.iterate_shared) {
 			wrapped_fop->fake_fop.iterate_shared =
 				ksu_susfs_hijacked_iterate_shared;
 		}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#endif
+#ifdef KSU_SUSFS_HAS_ITERATE
+#ifdef KSU_SUSFS_HAS_ITERATE_SHARED
 		else if (wrapped_fop->fake_fop.iterate) {
+#else
+		if (wrapped_fop->fake_fop.iterate) {
+#endif
 			wrapped_fop->fake_fop.iterate =
 				ksu_susfs_hijacked_iterate;
 		}

@@ -1,6 +1,10 @@
 #include <linux/cred.h>
 #include <linux/fs.h>
+#ifdef KSU_SUSFS_HAS_GENERIC_RADIX_TREE
 #include <linux/generic-radix-tree.h>
+#else
+#include <linux/flex_array.h>
+#endif
 #include <linux/hashtable.h>
 #include <linux/highmem.h>
 #include <linux/huge_mm.h>
@@ -13,16 +17,15 @@
 #include <linux/mempolicy.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
-#include <linux/page_idle.h>
+#ifdef KSU_SUSFS_HAS_MM_WALK_OPS
 #include <linux/pagewalk.h>
+#endif
 #include <linux/pagemap.h>
 #include <linux/namei.h>
-#include <linux/pgsize_migration.h>
 #include <linux/ptrace.h>
 #include <linux/rculist.h>
 #include <linux/rcupdate.h>
 #include <linux/rmap.h>
-#include <linux/sched/mm.h>
 #include <linux/seq_file.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
@@ -41,6 +44,7 @@
 #include "ksu.h"
 #include "policy/allowlist.h"
 #include "selinux/selinux.h"
+#include "susfs/compat.h"
 #include "susfs/kstat.h"
 #include "susfs/susfs.h"
 
@@ -113,6 +117,92 @@ struct ksu_susfs_map_files_info {
 	fmode_t mode;
 };
 
+struct ksu_susfs_map_files_store {
+#ifdef KSU_SUSFS_HAS_GENERIC_RADIX_TREE
+	GENRADIX(struct ksu_susfs_map_files_info) entries;
+#else
+	struct flex_array *entries;
+#endif
+};
+
+static int ksu_susfs_map_files_store_init(
+	struct ksu_susfs_map_files_store *store, unsigned long capacity)
+{
+#ifdef KSU_SUSFS_HAS_GENERIC_RADIX_TREE
+	(void)capacity;
+	genradix_init(&store->entries);
+	return 0;
+#else
+	if (!capacity) {
+		return 0;
+	}
+	if (capacity > UINT_MAX) {
+		return -EOVERFLOW;
+	}
+
+	store->entries = flex_array_alloc(
+		sizeof(struct ksu_susfs_map_files_info), capacity, GFP_KERNEL);
+	if (!store->entries ||
+	    flex_array_prealloc(store->entries, 0, capacity, GFP_KERNEL)) {
+		if (store->entries) {
+			flex_array_free(store->entries);
+			store->entries = NULL;
+		}
+		return -ENOMEM;
+	}
+
+	return 0;
+#endif
+}
+
+static int ksu_susfs_map_files_store_add(
+	struct ksu_susfs_map_files_store *store, unsigned long index,
+	const struct ksu_susfs_map_files_info *info)
+{
+#ifdef KSU_SUSFS_HAS_GENERIC_RADIX_TREE
+	struct ksu_susfs_map_files_info *entry =
+		genradix_ptr_alloc(&store->entries, index, GFP_KERNEL);
+
+	if (!entry) {
+		return -ENOMEM;
+	}
+	*entry = *info;
+	return 0;
+#else
+	if (index > UINT_MAX || !store->entries) {
+		return -EOVERFLOW;
+	}
+	return flex_array_put(store->entries, index, (void *)info, GFP_KERNEL);
+#endif
+}
+
+static struct ksu_susfs_map_files_info *
+ksu_susfs_map_files_store_get(struct ksu_susfs_map_files_store *store,
+				      unsigned long index)
+{
+#ifdef KSU_SUSFS_HAS_GENERIC_RADIX_TREE
+	return genradix_ptr(&store->entries, index);
+#else
+	if (index > UINT_MAX || !store->entries) {
+		return NULL;
+	}
+	return flex_array_get(store->entries, index);
+#endif
+}
+
+static void ksu_susfs_map_files_store_free(
+	struct ksu_susfs_map_files_store *store)
+{
+#ifdef KSU_SUSFS_HAS_GENERIC_RADIX_TREE
+	genradix_free(&store->entries);
+#else
+	if (store->entries) {
+		flex_array_free(store->entries);
+		store->entries = NULL;
+	}
+#endif
+}
+
 static DEFINE_HASHTABLE(ksu_susfs_kstat_ht, KSU_SUSFS_KSTAT_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_susfs_sus_map_ht, KSU_SUSFS_KSTAT_HASH_BITS);
 static LIST_HEAD(ksu_susfs_kstat_list);
@@ -123,8 +213,10 @@ static DEFINE_STATIC_KEY_FALSE(ksu_susfs_kstat_enabled);
 static DEFINE_STATIC_KEY_FALSE(ksu_susfs_sus_map_enabled);
 
 static struct kretprobe *ksu_susfs_vfs_getattr_nosec_rp;
+#ifdef KSU_SUSFS_HAS_SMAPS_ROLLUP
 static int (*ksu_susfs_orig_pid_smaps_rollup_open)(struct inode *inode,
 						   struct file *file);
+#endif
 static ssize_t (*ksu_susfs_orig_pagemap_read)(struct file *file,
 					      char __user *buf, size_t count,
 					      loff_t *ppos);
@@ -144,7 +236,9 @@ static int (*ksu_susfs_orig_smaps_show)(struct seq_file *m, void *v);
 static bool ksu_susfs_getattr_ready;
 static bool ksu_susfs_maps_ready;
 static bool ksu_susfs_smaps_ready;
+#ifdef KSU_SUSFS_HAS_SMAPS_ROLLUP
 static bool ksu_susfs_smaps_rollup_ready;
+#endif
 static bool ksu_susfs_pagemap_ready;
 static bool ksu_susfs_map_files_iterate_ready;
 static bool ksu_susfs_map_files_lookup_ready;
@@ -164,6 +258,12 @@ static instantiate_t *ksu_susfs_map_files_instantiate;
 #define KSU_SUSFS_PAGEMAP_ENTRY_BYTES sizeof(u64)
 #define KSU_SUSFS_PSS_SHIFT 12
 
+#ifdef KSU_SUSFS_HAS_ITERATE_SHARED
+#define KSU_SUSFS_ITERATE_MEMBER iterate_shared
+#else
+#define KSU_SUSFS_ITERATE_MEMBER iterate
+#endif
+
 /*
  * The hookless sus_map runtime layer intentionally stays close to the
  * upstream SUSFS procfs patch surface. Direct map_files lookup/revalidate and
@@ -177,7 +277,9 @@ static const bool ksu_susfs_sus_map_proc_mem_enabled = false;
  * preload mapping is registered via add_sus_map. Keep hookless sus_map on the
  * low-risk procfs surface until those paths are narrowed down.
  */
+#ifdef KSU_SUSFS_HAS_SMAPS_ROLLUP
 static const bool ksu_susfs_sus_map_smaps_rollup_enabled = false;
+#endif
 static const bool ksu_susfs_sus_map_pagemap_enabled = false;
 static const bool ksu_susfs_sus_map_map_files_iterate_enabled = false;
 
@@ -711,7 +813,7 @@ static int ksu_susfs_patch_fop_iterate_shared(
 		return -EINVAL;
 	}
 
-	orig_iterate_shared = READ_ONCE(fops->iterate_shared);
+	orig_iterate_shared = READ_ONCE(fops->KSU_SUSFS_ITERATE_MEMBER);
 	if (!orig_iterate_shared) {
 		return -EINVAL;
 	}
@@ -720,7 +822,7 @@ static int ksu_susfs_patch_fop_iterate_shared(
 		*old_iterate_shared = orig_iterate_shared;
 	}
 
-	dst = (void *)&((struct file_operations *)fops)->iterate_shared;
+	dst = (void *)&((struct file_operations *)fops)->KSU_SUSFS_ITERATE_MEMBER;
 	return ksu_patch_text(dst, &new_iterate_shared,
 			      sizeof(new_iterate_shared),
 			      KSU_PATCH_TEXT_FLUSH_DCACHE);
@@ -738,7 +840,7 @@ static void ksu_susfs_restore_fop_iterate_shared(
 	}
 
 	orig_iterate_shared = *old_iterate_shared;
-	dst = (void *)&((struct file_operations *)fops)->iterate_shared;
+	dst = (void *)&((struct file_operations *)fops)->KSU_SUSFS_ITERATE_MEMBER;
 	if (ksu_patch_text(dst, &orig_iterate_shared,
 			   sizeof(orig_iterate_shared),
 			   KSU_PATCH_TEXT_FLUSH_DCACHE)) {
@@ -887,7 +989,7 @@ static int ksu_susfs_sus_map_scan_locked(struct mm_struct *mm,
 	vma = find_vma(mm, start);
 	while (vma && vma->vm_start < limit) {
 		if (!ksu_susfs_sus_map_match_vma(vma)) {
-			vma = vma->vm_next;
+			vma = ksu_susfs_next_vma(mm, vma);
 			continue;
 		}
 
@@ -922,11 +1024,11 @@ static int ksu_susfs_sus_map_next_boundary(struct mm_struct *mm,
 		return -EINVAL;
 	}
 
-	if (!mmget_not_zero(mm)) {
+	if (!ksu_susfs_mmget_not_zero(mm)) {
 		return 0;
 	}
 
-	err = mmap_read_lock_killable(mm);
+	err = ksu_susfs_mmap_read_lock_killable(mm);
 	if (err) {
 		mmput(mm);
 		return err;
@@ -935,7 +1037,7 @@ static int ksu_susfs_sus_map_next_boundary(struct mm_struct *mm,
 	limit = ksu_susfs_clamp_addr_range(mm, start, len);
 	err = ksu_susfs_sus_map_scan_locked(mm, start, limit, hidden, boundary);
 
-	mmap_read_unlock(mm);
+	ksu_susfs_mmap_read_unlock(mm);
 	mmput(mm);
 	return err;
 }
@@ -978,15 +1080,13 @@ static size_t ksu_susfs_pagemap_addr_bytes(unsigned long start,
 static struct vm_area_struct *
 ksu_susfs_m_next_vma(struct proc_maps_private *priv, struct vm_area_struct *vma)
 {
-	struct mm_struct *mm = priv->mm;
-	unsigned long index = vma->vm_end;
 	struct vm_area_struct *next;
 
 	if (vma == priv->tail_vma) {
 		return NULL;
 	}
 
-	next = mt_find(&mm->mm_mt, &index, ULONG_MAX);
+	next = ksu_susfs_next_vma(priv->mm, vma);
 	if (next) {
 		return next;
 	}
@@ -1018,20 +1118,21 @@ static void ksu_susfs_show_vma_header_prefix(struct seq_file *m,
 					     unsigned long ino)
 {
 	seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
-	seq_put_hex_ll(m, NULL, start, 8);
-	seq_put_hex_ll(m, "-", end, 8);
+	ksu_susfs_seq_put_hex_ll(m, NULL, start, 8);
+	ksu_susfs_seq_put_hex_ll(m, "-", end, 8);
 	seq_putc(m, ' ');
 	seq_putc(m, flags & VM_READ ? 'r' : '-');
 	seq_putc(m, flags & VM_WRITE ? 'w' : '-');
 	seq_putc(m, flags & VM_EXEC ? 'x' : '-');
 	seq_putc(m, flags & VM_MAYSHARE ? 's' : 'p');
-	seq_put_hex_ll(m, " ", pgoff, 8);
-	seq_put_hex_ll(m, " ", MAJOR(dev), 2);
-	seq_put_hex_ll(m, ":", MINOR(dev), 2);
+	ksu_susfs_seq_put_hex_ll(m, " ", pgoff, 8);
+	ksu_susfs_seq_put_hex_ll(m, " ", MAJOR(dev), 2);
+	ksu_susfs_seq_put_hex_ll(m, ":", MINOR(dev), 2);
 	seq_put_decimal_ull(m, " ", ino);
 	seq_putc(m, ' ');
 }
 
+#ifdef KSU_SUSFS_HAS_VMA_ANON_NAME
 static void ksu_susfs_seq_print_vma_name(struct seq_file *m,
 					 struct vm_area_struct *vma)
 {
@@ -1056,8 +1157,20 @@ static void ksu_susfs_seq_print_vma_name(struct seq_file *m,
 		long pages_pinned;
 		struct page *page;
 
+#if defined(KSU_SUSFS_GUP_REMOTE_HAS_TASK) && \
+	defined(KSU_SUSFS_GUP_REMOTE_HAS_LOCKED)
 		pages_pinned = get_user_pages_remote(current, mm,
 				page_start_vaddr, 1, 0, &page, NULL, NULL);
+#elif defined(KSU_SUSFS_GUP_REMOTE_HAS_TASK)
+		pages_pinned = get_user_pages_remote(current, mm,
+				page_start_vaddr, 1, 0, &page, NULL);
+#elif defined(KSU_SUSFS_GUP_REMOTE_HAS_VMAS)
+		pages_pinned = get_user_pages_remote(mm, page_start_vaddr, 1, 0,
+					     &page, NULL, NULL);
+#else
+		pages_pinned = get_user_pages_remote(mm, page_start_vaddr, 1, 0,
+					     &page, NULL);
+#endif
 		if (pages_pinned < 1) {
 			seq_puts(m, "<fault>]");
 			return;
@@ -1081,6 +1194,7 @@ static void ksu_susfs_seq_print_vma_name(struct seq_file *m,
 
 	seq_putc(m, ']');
 }
+#endif
 
 static void ksu_susfs_show_map_vma(struct seq_file *m,
 				   struct vm_area_struct *vma)
@@ -1143,10 +1257,12 @@ static void ksu_susfs_show_map_vma(struct seq_file *m,
 			goto done;
 		}
 
+#ifdef KSU_SUSFS_HAS_VMA_ANON_NAME
 		if (vma_get_anon_name(vma)) {
 			seq_pad(m, ' ');
 			ksu_susfs_seq_print_vma_name(m, vma);
 		}
+#endif
 	}
 
 done:
@@ -1170,7 +1286,8 @@ static int ksu_susfs_show_map(struct seq_file *m, void *v)
 		ksu_susfs_show_map_vma(m, vma);
 	}
 
-	show_map_pad_vma(vma, m, (void *)ksu_susfs_show_map_vma, false);
+	ksu_susfs_show_map_pad_vma(vma, m,
+				   (void *)ksu_susfs_show_map_vma, false);
 	ksu_susfs_m_cache_vma(m, vma);
 	return 0;
 }
@@ -1298,6 +1415,7 @@ static int ksu_susfs_show_smap(struct seq_file *m, void *v)
 	return ret;
 }
 
+#ifdef KSU_SUSFS_HAS_SMAPS_ROLLUP
 static void ksu_susfs_smaps_page_accumulate(
 	struct ksu_susfs_mem_size_stats *mss, struct page *page,
 	unsigned long size, unsigned long pss, bool dirty, bool locked,
@@ -1337,7 +1455,7 @@ static void ksu_susfs_smaps_account(struct ksu_susfs_mem_size_stats *mss,
 				    bool young, bool dirty, bool locked)
 {
 	int i;
-	int nr = compound ? compound_nr(page) : 1;
+	int nr = compound ? ksu_susfs_compound_nr(page) : 1;
 	unsigned long size = nr * PAGE_SIZE;
 
 	if (PageAnon(page)) {
@@ -1348,7 +1466,7 @@ static void ksu_susfs_smaps_account(struct ksu_susfs_mem_size_stats *mss,
 	}
 
 	mss->resident += size;
-	if (young || page_is_young(page) || PageReferenced(page)) {
+	if (young || ksu_susfs_page_is_young(page) || PageReferenced(page)) {
 		mss->referenced += size;
 	}
 
@@ -1416,8 +1534,10 @@ static void ksu_susfs_smaps_pte_entry(pte_t *pte, unsigned long addr,
 			}
 		} else if (is_migration_entry(swpent)) {
 			page = migration_entry_to_page(swpent);
+#ifdef KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
 		} else if (is_device_private_entry(swpent)) {
 			page = device_private_entry_to_page(swpent);
+#endif
 		}
 	} else if (unlikely(IS_ENABLED(CONFIG_SHMEM) &&
 			    mss->check_shmem_swap && pte_none(*pte))) {
@@ -1427,7 +1547,7 @@ static void ksu_susfs_smaps_pte_entry(pte_t *pte, unsigned long addr,
 			return;
 		}
 
-		if (xa_is_value(page)) {
+		if (ksu_susfs_pagecache_is_value(page)) {
 			mss->swap += PAGE_SIZE;
 		} else {
 			put_page(page);
@@ -1521,13 +1641,16 @@ static int ksu_susfs_smaps_hugetlb_range(pte_t *pte, unsigned long hmask,
 
 		if (is_migration_entry(swpent)) {
 			page = migration_entry_to_page(swpent);
+#ifdef KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
 		} else if (is_device_private_entry(swpent)) {
 			page = device_private_entry_to_page(swpent);
+#endif
 		}
 	}
 
 	if (page) {
-		if (page_mapcount(page) >= 2 || hugetlb_pmd_shared(pte)) {
+		if (page_mapcount(page) >= 2 ||
+		    ksu_susfs_hugetlb_pmd_shared(pte)) {
 			mss->shared_hugetlb += huge_page_size(hstate_vma(vma));
 		} else {
 			mss->private_hugetlb += huge_page_size(hstate_vma(vma));
@@ -1540,6 +1663,7 @@ static int ksu_susfs_smaps_hugetlb_range(pte_t *pte, unsigned long hmask,
 #define ksu_susfs_smaps_hugetlb_range NULL
 #endif
 
+#ifdef KSU_SUSFS_HAS_MM_WALK_OPS
 static const struct mm_walk_ops ksu_susfs_smaps_walk_ops = {
 	.pmd_entry = ksu_susfs_smaps_pte_range,
 	.pte_hole = NULL,
@@ -1551,6 +1675,35 @@ static const struct mm_walk_ops ksu_susfs_smaps_shmem_walk_ops = {
 	.pte_hole = ksu_susfs_smaps_pte_hole,
 	.hugetlb_entry = ksu_susfs_smaps_hugetlb_range,
 };
+
+static int ksu_susfs_walk_page_vma(struct vm_area_struct *vma,
+				   struct ksu_susfs_mem_size_stats *mss,
+				   bool check_shmem_swap)
+{
+	const struct mm_walk_ops *ops = check_shmem_swap ?
+		&ksu_susfs_smaps_shmem_walk_ops : &ksu_susfs_smaps_walk_ops;
+
+	return walk_page_vma(vma, ops, mss);
+}
+#else
+static int ksu_susfs_walk_page_vma(struct vm_area_struct *vma,
+				   struct ksu_susfs_mem_size_stats *mss,
+				   bool check_shmem_swap)
+{
+	struct mm_walk walk = {
+		.pmd_entry = ksu_susfs_smaps_pte_range,
+		.hugetlb_entry = ksu_susfs_smaps_hugetlb_range,
+		.mm = vma->vm_mm,
+		.private = mss,
+	};
+
+	if (check_shmem_swap) {
+		walk.pte_hole = ksu_susfs_smaps_pte_hole;
+	}
+
+	return walk_page_vma(vma, &walk);
+}
+#endif
 
 static void ksu_susfs_smap_gather_stats(struct vm_area_struct *vma,
 					struct ksu_susfs_mem_size_stats *mss)
@@ -1565,16 +1718,16 @@ static void ksu_susfs_smap_gather_stats(struct vm_area_struct *vma,
 			mss->swap += shmem_swapped;
 		} else {
 			mss->check_shmem_swap = true;
-			walk_page_vma(vma, &ksu_susfs_smaps_shmem_walk_ops, mss);
+			ksu_susfs_walk_page_vma(vma, mss, true);
 			return;
 		}
 	}
 #endif
-	walk_page_vma(vma, &ksu_susfs_smaps_walk_ops, mss);
+	ksu_susfs_walk_page_vma(vma, mss, false);
 }
 
 #define KSU_SUSFS_SEQ_PUT_DEC(str, val) \
-	seq_put_decimal_ull_width(m, str, (val) >> 10, 8)
+	ksu_susfs_seq_put_decimal_ull_width(m, str, (val) >> 10, 8)
 
 static void ksu_susfs_show_smap_common(
 	struct seq_file *m, const struct ksu_susfs_mem_size_stats *mss,
@@ -1602,8 +1755,8 @@ static void ksu_susfs_show_smap_common(
 	KSU_SUSFS_SEQ_PUT_DEC(" kB\nShmemPmdMapped: ", mss->shmem_thp);
 	KSU_SUSFS_SEQ_PUT_DEC(" kB\nFilePmdMapped:  ", mss->file_thp);
 	KSU_SUSFS_SEQ_PUT_DEC(" kB\nShared_Hugetlb: ", mss->shared_hugetlb);
-	seq_put_decimal_ull_width(m, " kB\nPrivate_Hugetlb: ",
-				  mss->private_hugetlb >> 10, 7);
+	ksu_susfs_seq_put_decimal_ull_width(
+		m, " kB\nPrivate_Hugetlb: ", mss->private_hugetlb >> 10, 7);
 	KSU_SUSFS_SEQ_PUT_DEC(" kB\nSwap:           ", mss->swap);
 	KSU_SUSFS_SEQ_PUT_DEC(" kB\nSwapPss:        ",
 			      mss->swap_pss >> KSU_SUSFS_PSS_SHIFT);
@@ -1656,21 +1809,22 @@ static int ksu_susfs_show_smaps_rollup(struct seq_file *m, void *v)
 	}
 
 	mm = priv->mm;
-	if (!mm || !mmget_not_zero(mm)) {
+	if (!mm || !ksu_susfs_mmget_not_zero(mm)) {
 		ret = -ESRCH;
 		goto out_put_task;
 	}
 
 	memset(&mss, 0, sizeof(mss));
 
-	ret = mmap_read_lock_killable(mm);
+	ret = ksu_susfs_mmap_read_lock_killable(mm);
 	if (ret) {
 		goto out_put_mm;
 	}
 
 	ksu_susfs_hold_task_mempolicy(priv);
 
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	for (vma = ksu_susfs_first_vma(mm); vma;
+	     vma = ksu_susfs_next_vma(mm, vma)) {
 		if (ksu_susfs_sus_map_match_vma(vma)) {
 			last_vma_end = vma->vm_end;
 			continue;
@@ -1693,7 +1847,7 @@ static int ksu_susfs_show_smaps_rollup(struct seq_file *m, void *v)
 	ksu_susfs_show_smap_common(m, &mss, true);
 
 	ksu_susfs_release_task_mempolicy(priv);
-	mmap_read_unlock(mm);
+	ksu_susfs_mmap_read_unlock(mm);
 
 out_put_mm:
 	mmput(mm);
@@ -1739,6 +1893,7 @@ static int ksu_susfs_pid_smaps_rollup_open(struct inode *inode,
 
 	return 0;
 }
+#endif
 
 static ssize_t ksu_susfs_pagemap_read(struct file *file, char __user *buf,
 				      size_t count, loff_t *ppos)
@@ -1907,12 +2062,12 @@ static int ksu_susfs_map_files_d_revalidate(struct dentry *dentry,
 
 	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
 	if (!IS_ERR_OR_NULL(mm)) {
-		status = mmap_read_lock_killable(mm);
+		status = ksu_susfs_mmap_read_lock_killable(mm);
 		if (!status) {
 			vma = find_exact_vma(mm, vm_start, vm_end);
 			hidden = vma && vma->vm_file &&
 				 ksu_susfs_sus_map_match_vma(vma);
-			mmap_read_unlock(mm);
+			ksu_susfs_mmap_read_unlock(mm);
 		}
 		mmput(mm);
 	}
@@ -1965,7 +2120,7 @@ static struct dentry *ksu_susfs_map_files_lookup(struct inode *dir,
 		return ERR_PTR(-ENOENT);
 	}
 
-	err = mmap_read_lock_killable(mm);
+	err = ksu_susfs_mmap_read_lock_killable(mm);
 	if (err) {
 		mmput(mm);
 		put_task_struct(task);
@@ -1977,7 +2132,7 @@ static struct dentry *ksu_susfs_map_files_lookup(struct inode *dir,
 		visible = true;
 	}
 
-	mmap_read_unlock(mm);
+	ksu_susfs_mmap_read_unlock(mm);
 	mmput(mm);
 	put_task_struct(task);
 
@@ -1997,7 +2152,8 @@ static int ksu_susfs_map_files_iterate_shared(struct file *file,
 	unsigned long nr_files;
 	unsigned long pos;
 	unsigned long i;
-	GENRADIX(struct ksu_susfs_map_files_info) fa;
+	struct ksu_susfs_map_files_store store = { };
+	struct ksu_susfs_map_files_info info;
 	struct ksu_susfs_map_files_info *p;
 	int ret;
 
@@ -2008,8 +2164,6 @@ static int ksu_susfs_map_files_iterate_shared(struct file *file,
 			       ksu_susfs_orig_map_files_iterate_shared(file, ctx) :
 			       -ENOSYS;
 	}
-
-	genradix_init(&fa);
 
 	ret = -ENOENT;
 	task = get_proc_task(file_inode(file));
@@ -2032,14 +2186,21 @@ static int ksu_susfs_map_files_iterate_shared(struct file *file,
 		goto out_put_task;
 	}
 
-	ret = mmap_read_lock_killable(mm);
+	ret = ksu_susfs_mmap_read_lock_killable(mm);
 	if (ret) {
+		mmput(mm);
+		goto out_put_task;
+	}
+	ret = ksu_susfs_map_files_store_init(&store, mm->map_count);
+	if (ret) {
+		ksu_susfs_mmap_read_unlock(mm);
 		mmput(mm);
 		goto out_put_task;
 	}
 
 	nr_files = 0;
-	for (vma = mm->mmap, pos = 2; vma; vma = vma->vm_next) {
+	for (vma = ksu_susfs_first_vma(mm), pos = 2; vma;
+	     vma = ksu_susfs_next_vma(mm, vma)) {
 		if (!vma->vm_file || ksu_susfs_sus_map_match_vma(vma)) {
 			continue;
 		}
@@ -2047,26 +2208,29 @@ static int ksu_susfs_map_files_iterate_shared(struct file *file,
 			continue;
 		}
 
-		p = genradix_ptr_alloc(&fa, nr_files++, GFP_KERNEL);
-		if (!p) {
-			ret = -ENOMEM;
-			mmap_read_unlock(mm);
+		info.start = vma->vm_start;
+		info.end = ksu_susfs_vma_pad_start(vma);
+		info.mode = vma->vm_file->f_mode;
+		ret = ksu_susfs_map_files_store_add(&store, nr_files, &info);
+		if (ret) {
+			ksu_susfs_mmap_read_unlock(mm);
 			mmput(mm);
 			goto out_put_task;
 		}
-
-		p->start = vma->vm_start;
-		p->end = VMA_PAD_START(vma);
-		p->mode = vma->vm_file->f_mode;
+		nr_files++;
 	}
-	mmap_read_unlock(mm);
+	ksu_susfs_mmap_read_unlock(mm);
 	mmput(mm);
 
 	for (i = 0; i < nr_files; i++) {
 		char name[4 * sizeof(long) + 2];
 		unsigned int len;
 
-		p = genradix_ptr(&fa, i);
+		p = ksu_susfs_map_files_store_get(&store, i);
+		if (!p) {
+			ret = -EIO;
+			break;
+		}
 		len = snprintf(name, sizeof(name), "%lx-%lx", p->start, p->end);
 		if (!proc_fill_cache(file, ctx, name, len,
 				     ksu_susfs_map_files_instantiate, task,
@@ -2079,7 +2243,7 @@ static int ksu_susfs_map_files_iterate_shared(struct file *file,
 out_put_task:
 	put_task_struct(task);
 out:
-	genradix_free(&fa);
+	ksu_susfs_map_files_store_free(&store);
 	return ret;
 }
 
@@ -2601,6 +2765,7 @@ int ksu_susfs_kstat_init(void)
 		}
 	}
 
+#ifdef KSU_SUSFS_HAS_SMAPS_ROLLUP
 	if (ksu_susfs_sus_map_smaps_rollup_enabled) {
 		err = ksu_susfs_patch_fop_open(
 			&proc_pid_smaps_rollup_operations,
@@ -2613,6 +2778,7 @@ int ksu_susfs_kstat_init(void)
 			ksu_susfs_smaps_rollup_ready = true;
 		}
 	}
+#endif
 
 	if (ksu_susfs_sus_map_pagemap_enabled) {
 		err = ksu_susfs_patch_fop_read(&proc_pagemap_operations,
@@ -2765,11 +2931,13 @@ void ksu_susfs_kstat_exit(void)
 		ksu_susfs_pagemap_ready = false;
 	}
 
+#ifdef KSU_SUSFS_HAS_SMAPS_ROLLUP
 	if (ksu_susfs_smaps_rollup_ready) {
 		ksu_susfs_restore_fop_open(&proc_pid_smaps_rollup_operations,
 					   &ksu_susfs_orig_pid_smaps_rollup_open);
 		ksu_susfs_smaps_rollup_ready = false;
 	}
+#endif
 
 	if (ksu_susfs_smaps_ready) {
 		ksu_susfs_restore_seqop_show(ksu_susfs_smaps_seqops,
