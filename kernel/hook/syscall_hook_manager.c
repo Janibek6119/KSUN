@@ -26,7 +26,7 @@
 #include "hook/syscall_hook.h"
 #include "hook/syscall_event_bridge.h"
 
-#ifdef CONFIG_KRETPROBES
+#if defined(CONFIG_KRETPROBES) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 
 static struct kretprobe *init_kretprobe(const char *name, kretprobe_handler_t handler)
 {
@@ -95,7 +95,8 @@ static struct kretprobe *syscall_regfunc_rp = NULL;
 static struct kretprobe *syscall_unregfunc_rp = NULL;
 #endif
 
-#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+#if defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 // sys_enter handler: redirect hooked syscalls to the dispatcher
 static void ksu_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 {
@@ -127,10 +128,13 @@ static void ksu_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 
 void __init ksu_syscall_hook_manager_init(void)
 {
+#if defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     int ret;
+#endif
     pr_info("hook_manager: ksu_hook_manager_init called\n");
 
-#ifdef CONFIG_KRETPROBES
+#if defined(CONFIG_KRETPROBES) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);
     syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);
 #endif
@@ -144,8 +148,15 @@ void __init ksu_syscall_hook_manager_init(void)
 #ifdef __NR_faccessat
     ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);
 #endif
+#ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+#ifdef __NR_reboot
+    ksu_register_syscall_hook(__NR_reboot, ksu_hook_reboot);
+#endif
+#endif
 
-#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+
+#if defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     ret = register_trace_sys_enter(ksu_sys_enter_handler, NULL);
 #ifndef CONFIG_KRETPROBES
     ksu_mark_running_process_locked();
@@ -165,15 +176,21 @@ void __init ksu_syscall_hook_manager_init(void)
 void __exit ksu_syscall_hook_manager_exit(void)
 {
     pr_info("hook_manager: ksu_hook_manager_exit called\n");
-#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+#if defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     unregister_trace_sys_enter(ksu_sys_enter_handler, NULL);
     tracepoint_synchronize_unregister();
     pr_info("hook_manager: sys_enter tracepoint unregistered\n");
 #endif
 
-#ifdef CONFIG_KRETPROBES
+#if defined(CONFIG_KRETPROBES) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     destroy_kretprobe(&syscall_regfunc_rp);
     destroy_kretprobe(&syscall_unregfunc_rp);
+#endif
+#ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+#ifdef __NR_reboot
+    ksu_unregister_syscall_hook(__NR_reboot);
+#endif
 #endif
 
     ksu_unregister_syscall_hook(__NR_setresuid);

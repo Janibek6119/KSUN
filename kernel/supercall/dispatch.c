@@ -375,7 +375,8 @@ static int do_set_app_profile(void __user *arg)
     ret = ksu_set_app_profile(&cmd.profile);
     if (!ret) {
         ksu_persistent_allow_list();
-#ifdef CONFIG_KSU_KPROBES_HOOK
+#if defined(CONFIG_KSU_KPROBES_HOOK) && \
+        !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
         ksu_mark_running_process();
 #endif
     }
@@ -706,6 +707,8 @@ static int do_get_hook_mode(void __user *arg)
 
 #ifdef CONFIG_KSU_MANUAL_HOOK
     const char *type = "Manual";
+#elif defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
+    const char *type = "SyscallTable";
 #elif defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS)
     const char *type = "Tracepoint";
 #else

@@ -278,7 +278,8 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
 	return 0;
 }
 
-#ifdef CONFIG_KSU_KPROBES_HOOK
+#if defined(CONFIG_KSU_KPROBES_HOOK) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = PT_REAL_REGS(regs);
@@ -462,7 +463,8 @@ void __init ksu_supercalls_init(void)
 {
     ksu_supercall_dump_commands();
 
-#ifdef CONFIG_KSU_KPROBES_HOOK
+#if defined(CONFIG_KSU_KPROBES_HOOK) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     int rc;
 
     rc = register_kprobe(&reboot_kp);
@@ -476,7 +478,8 @@ void __init ksu_supercalls_init(void)
 
 void __exit ksu_supercalls_exit(void)
 {
-#ifdef CONFIG_KSU_KPROBES_HOOK
+#if defined(CONFIG_KSU_KPROBES_HOOK) && \
+	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     unregister_kprobe(&reboot_kp);
 #endif
     ksu_supercall_cleanup_state();

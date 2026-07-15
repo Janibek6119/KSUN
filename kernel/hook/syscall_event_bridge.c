@@ -15,6 +15,7 @@
 #include "policy/app_profile.h"
 #include "runtime/ksud.h"
 #include "sulog/event.h"
+#include "supercall/supercall.h"
 #include "hook/syscall_hook.h"
 #include "hook/syscall_event_bridge.h"
 #include "feature/adb_root.h"
@@ -40,8 +41,10 @@ static int ksu_handle_init_mark_tracker(const char __user **filename_user)
         pr_info("hook_manager: escape to root for init executing ksud: %d\n", current->pid);
         escape_to_root_for_init();
     } else if (likely(strstr(path, "/app_process") == NULL && strstr(path, "/adbd") == NULL)) {
+#ifndef CONFIG_KSU_TAMPER_SYSCALL_TABLE
         pr_info("hook_manager: unmark %d exec %s\n", current->pid, path);
         ksu_clear_task_tracepoint_flag_if_needed(current);
+#endif
     }
 
     return 0;
@@ -111,4 +114,15 @@ long __nocfi ksu_hook_setresuid(int orig_nr, const struct pt_regs *regs)
 
     ksu_handle_setresuid(old_uid, current_uid().val);
     return ret;
+}
+
+long __nocfi ksu_hook_reboot(int orig_nr, const struct pt_regs *regs)
+{
+    int magic1 = (int)PT_REGS_PARM1(regs);
+    int magic2 = (int)PT_REGS_PARM2(regs);
+    unsigned int cmd = (unsigned int)PT_REGS_PARM3(regs);
+    void __user *arg = (void __user *)PT_REGS_SYSCALL_PARM4(regs);
+
+    ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+    return ksu_invoke_syscall_nr(orig_nr, regs);
 }

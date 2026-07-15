@@ -57,6 +57,17 @@ config KSU_KPROBES_HOOK
 	  Kernels below 5.10 still require the dependencies above and should be
 	  validated on the target device.
 
+config KSU_TAMPER_SYSCALL_TABLE
+	bool "KernelSU syscall-table tamper hook"
+	depends on KSU_KPROBES_HOOK
+	depends on ARM64 || X86_64
+	default n
+	help
+	  Replace hooked syscall table entries directly instead of routing
+	  them through the sys_enter tracepoint dispatcher. This mirrors the
+	  downstream KernelSU syscall-table tamper mode while reusing
+	  KernelSU-Next's central syscall handlers.
+
 config KSU_KPROBES_SUSFS
 	bool "KernelSU hookless SUSFS"
 	depends on KSU && KSU != m && KSU_KPROBES_HOOK
