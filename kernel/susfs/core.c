@@ -1659,18 +1659,24 @@ static bool ksu_susfs_handle_variant_compat(void __user *arg)
 
 static bool ksu_susfs_handle_features_compat(void __user *arg)
 {
-	struct ksu_susfs_enabled_features_cmd cmd = { .err = 0 };
+	struct ksu_susfs_enabled_features_cmd *cmd;
 
-	strscpy(cmd.enabled_features,
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (!cmd) {
+		return true;
+	}
+
+	strscpy(cmd->enabled_features,
 		"hookless_vfs\nhookless_procfs\nsus_path\nsus_path_loop\n"
 		"open_redirect\nsus_mount\nsus_kstat\nsus_map\n"
 		"spoof_cmdline_or_bootconfig\nspoof_uname\n"
 		"avc_log_spoofing\nproc_maps_kstat\nproc_smaps_kstat\n"
 		"proc_maps_hide\nproc_smaps_hide\n",
-		sizeof(cmd.enabled_features));
-	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+		sizeof(cmd->enabled_features));
+	if (copy_to_user(arg, cmd, sizeof(*cmd))) {
 		pr_err("susfs: feature compat copy_to_user failed\n");
 	}
+	kfree(cmd);
 	return true;
 }
 
