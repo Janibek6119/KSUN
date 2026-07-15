@@ -35,7 +35,7 @@
 #define KSU_SUSFS_SB_HASH_BITS 4
 #define KSU_SUSFS_SIGNATURE 0x53555346534b5355ULL
 #define KSU_SUSFS_VARIANT "hookless"
-#define KSU_SUSFS_VERSION "v0.1"
+#define KSU_SUSFS_VERSION "v0.2"
 
 static const char *const ksu_susfs_default_hide_paths[] = {
 	"/product/overlay/LineageSDKOverlaySM8350.apk",

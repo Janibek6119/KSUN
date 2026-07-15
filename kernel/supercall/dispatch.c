@@ -709,6 +709,8 @@ static int do_get_hook_mode(void __user *arg)
     const char *type = "Manual";
 #elif defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     const char *type = "SyscallTable";
+#elif defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
+    const char *type = "BranchLink";
 #elif defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS)
     const char *type = "Tracepoint";
 #else

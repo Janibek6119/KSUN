@@ -4,6 +4,10 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 
+struct mount;
+struct ns_common;
+struct vfsmount;
+
 int ksu_susfs_procfs_init(void);
 void ksu_susfs_procfs_exit(void);
 
@@ -12,5 +16,15 @@ bool ksu_susfs_handle_cmdline_compat(void __user *arg);
 bool ksu_susfs_handle_uname_compat(void __user *arg);
 bool ksu_susfs_handle_avc_compat(void __user *arg);
 void ksu_susfs_handle_setuid(uid_t old_uid, uid_t new_uid);
+
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+bool ksu_susfs_should_hide_new_vfsmount(void);
+bool ksu_susfs_should_hide_cloned_mount(struct mount *old);
+void ksu_susfs_mark_vfsmount_hidden(struct vfsmount *mnt, bool hide);
+void ksu_susfs_mark_mount_hidden(struct mount *mnt, bool hide);
+void ksu_susfs_handle_cleanup_mnt(struct mount *mnt);
+struct ns_common *ksu_susfs_handle_mntns_get(struct ns_common *orig_ns);
+void ksu_susfs_set_mount_runtime_ready(bool ready);
+#endif
 
 #endif // __KSU_H_SUSFS_PROCFS

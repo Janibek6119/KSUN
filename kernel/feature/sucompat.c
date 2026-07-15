@@ -16,6 +16,7 @@
 #include <asm/current.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/task_stack.h>
@@ -35,8 +36,13 @@
 #include "compat/kernel_compat.h"
 #ifdef CONFIG_KSU_KPROBES_HOOK
 #include "hook/syscall_hook.h"
-#else
+#endif
+#if !defined(CONFIG_KSU_KPROBES_HOOK) || defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
 #include "feature/adb_root.h"
+#endif
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+#include "hook/syscall_event_bridge.h"
+#include "hook/tp_marker.h"
 #endif
 #include "sulog/event.h"
 #include "ksu.h"
@@ -175,6 +181,90 @@ do_orig_stat:
 	return ksu_invoke_syscall_nr(orig_nr, regs);
 }
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+static bool ksu_redirect_su_path(const char __user **filename_user, char event)
+{
+	const char __user *new_filename;
+	const struct cred *old_cred;
+	char path[sizeof(su_path) + 1];
+	bool exists;
+
+	if (!ksu_su_compat_enabled)
+		return false;
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
+		return false;
+	if (!filename_user || !*filename_user)
+		return false;
+
+	memset(path, 0, sizeof(path));
+	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+	if (likely(memcmp(path, su_path, sizeof(su_path))))
+		return false;
+
+	old_cred = override_creds(ksu_cred);
+	exists = is_ksud_exists();
+	revert_creds(old_cred);
+	if (!exists)
+		return false;
+
+	new_filename = ksud_user_path();
+	if (!new_filename)
+		return false;
+
+	ksu_compat_sulog(event);
+	*filename_user = new_filename;
+	return true;
+}
+
+void ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+			  int *mode, int *flags)
+{
+	(void)dfd;
+	(void)mode;
+	(void)flags;
+
+	if (ksu_redirect_su_path(filename_user, 'a'))
+		pr_info("faccessat su->ksud!\n");
+}
+
+void ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+{
+	(void)dfd;
+	(void)flags;
+
+	if (ksu_redirect_su_path(filename_user, 's'))
+		pr_info("newfstatat su->ksud!\n");
+}
+
+bool ksu_handle_stat_kernel_filename(char *filename)
+{
+	const struct cred *old_cred;
+	bool exists;
+
+	if (!ksu_su_compat_enabled)
+		return false;
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
+		return false;
+	if (!filename)
+		return false;
+	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
+		return false;
+
+	old_cred = override_creds(ksu_cred);
+	exists = is_ksud_exists();
+	revert_creds(old_cred);
+	if (!exists)
+		return false;
+
+	if (sizeof(KSUD_PATH) > sizeof(SU_PATH))
+		return false;
+	ksu_compat_sulog('s');
+	memcpy(filename, KSUD_PATH, sizeof(KSUD_PATH));
+	pr_info("stat filename su->ksud!\n");
+	return true;
+}
+#endif
+
 long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, struct pt_regs *regs)
 {
 	const char __user *fn;
@@ -261,9 +351,16 @@ do_orig_execve:
 	return ksu_invoke_syscall_nr(orig_nr, regs);
 }
 
-#else // CONFIG_KSU_MANUAL_HOOK
+#endif // CONFIG_KSU_KPROBES_HOOK
 
+#if !defined(CONFIG_KSU_KPROBES_HOOK) || defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
+#ifndef CONFIG_KSU_KPROBES_HOOK
 extern bool ksud_execve_key;
+static inline bool ksu_ksud_execve_hook_enabled(void)
+{
+	return ksud_execve_key;
+}
+#endif
 
 static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename, void *argv)
 {
@@ -295,6 +392,24 @@ static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename,
 	return 0;
 }
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+static void ksu_handle_execveat_init_mark_tracker(const char *filename)
+{
+	if (!filename)
+		return;
+
+	if (unlikely(strcmp(filename, KSUD_PATH) == 0)) {
+		pr_info("hook_manager: escape to root for init executing ksud\n");
+		escape_to_root_for_init();
+	} else if (likely(!strstr(filename, "/app_process") &&
+			  !strstr(filename, "/adbd"))) {
+		pr_info("hook_manager: unmark %d exec %s\n", current->pid,
+			filename);
+		ksu_clear_task_tracepoint_flag_if_needed(current);
+	}
+}
+#endif
+
 int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int *flags)
 {
 	long ret;
@@ -302,17 +417,15 @@ int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int
 	(void)flags;
 
 	if (current->pid != 1 && is_init(current_cred())) {
-		if (unlikely(strcmp(filename, KSUD_PATH) == 0)) {
-			pr_info("hook_manager: escape to root for init executing ksud\n");
-			escape_to_root_for_init();
-		}
-
-		ret = ksu_adb_root_handle_execve(filename, (struct user_arg_ptr *)envp);
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+		ksu_handle_execveat_init_mark_tracker(filename);
+#endif
+		ret = ksu_adb_root_handle_execveat(filename, (struct user_arg_ptr *)envp);
 		if (ret)
 			pr_err("adb root failed: %ld\n", ret);
 	}
 
-	if (unlikely(ksud_execve_key)) {
+	if (unlikely(ksu_ksud_execve_hook_enabled())) {
 		ksu_handle_execveat_ksud(filename, (struct user_arg_ptr *)argv);
 	}
 
@@ -339,7 +452,7 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 				   __never_use_flags);
 }
 
-#endif // CONFIG_KSU_MANUAL_HOOK
+#endif // !CONFIG_KSU_KPROBES_HOOK || CONFIG_KSU_HACK_ARM64_BRANCH_LINK
 
 // sucompat: permitted process can execute 'su' to gain root access.
 void __init ksu_sucompat_init()

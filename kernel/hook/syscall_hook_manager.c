@@ -25,6 +25,9 @@
 #include "hook/setuid_hook.h"
 #include "hook/syscall_hook.h"
 #include "hook/syscall_event_bridge.h"
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+#include "hook/arm64/branch_link_hook.h"
+#endif
 
 #if defined(CONFIG_KRETPROBES) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 
@@ -141,6 +144,7 @@ void __init ksu_syscall_hook_manager_init(void)
 
     // Register syscall hooks via dispatcher
     ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid);
+#ifndef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
     ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);
 #ifdef __NR_newfstatat
     ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat);
@@ -148,12 +152,12 @@ void __init ksu_syscall_hook_manager_init(void)
 #ifdef __NR_faccessat
     ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);
 #endif
+#endif
 #ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
 #ifdef __NR_reboot
     ksu_register_syscall_hook(__NR_reboot, ksu_hook_reboot);
 #endif
 #endif
-
 
 #if defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
 	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
@@ -168,6 +172,10 @@ void __init ksu_syscall_hook_manager_init(void)
     }
 #endif
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+    ksu_branch_link_patch_init();
+#endif
+
     ksu_setuid_hook_init();
     ksu_sucompat_init();
     ksu_avc_spoof_init();
@@ -176,6 +184,9 @@ void __init ksu_syscall_hook_manager_init(void)
 void __exit ksu_syscall_hook_manager_exit(void)
 {
     pr_info("hook_manager: ksu_hook_manager_exit called\n");
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+    ksu_branch_link_patch_exit();
+#endif
 #if defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
 	!defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
     unregister_trace_sys_enter(ksu_sys_enter_handler, NULL);
@@ -187,19 +198,21 @@ void __exit ksu_syscall_hook_manager_exit(void)
     destroy_kretprobe(&syscall_regfunc_rp);
     destroy_kretprobe(&syscall_unregfunc_rp);
 #endif
+
 #ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
 #ifdef __NR_reboot
     ksu_unregister_syscall_hook(__NR_reboot);
 #endif
 #endif
-
     ksu_unregister_syscall_hook(__NR_setresuid);
+#ifndef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
     ksu_unregister_syscall_hook(__NR_execve);
 #ifdef __NR_newfstatat
     ksu_unregister_syscall_hook(__NR_newfstatat);
 #endif
 #ifdef __NR_faccessat
     ksu_unregister_syscall_hook(__NR_faccessat);
+#endif
 #endif
 
     ksu_syscall_hook_exit();

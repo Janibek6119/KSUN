@@ -126,6 +126,9 @@ static int (*ksu_susfs_orig_show_mountstats)(struct seq_file *m,
 					     struct vfsmount *mnt);
 
 static const struct file_operations *ksu_susfs_fdinfo_fops;
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+static struct ns_common *(*ksu_susfs_orig_mntns_get)(struct task_struct *task);
+#endif
 static struct kretprobe *ksu_susfs_vfs_create_mount_rp;
 static struct kretprobe *ksu_susfs_clone_mnt_rp;
 static struct kretprobe *ksu_susfs_mntns_get_rp;
@@ -985,33 +988,96 @@ static struct mnt_namespace *ksu_susfs_get_visible_mnt_ns(void)
 	return mnt_ns;
 }
 
-static int ksu_susfs_mntns_get_handler(struct kretprobe_instance *ri,
-				       struct pt_regs *regs)
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+struct ns_common *
+#else
+static struct ns_common *
+#endif
+ksu_susfs_handle_mntns_get(struct ns_common *orig_ns)
 {
-	struct ns_common *orig_ns;
 	struct mnt_namespace *visible_ns;
 
 	if (!ksu_susfs_mntns_identity_view_enabled()) {
-		return 0;
+		return orig_ns;
 	}
 
-	orig_ns = (struct ns_common *)regs_return_value(regs);
 	if (!orig_ns) {
-		return 0;
+		return orig_ns;
 	}
 
 	visible_ns = ksu_susfs_get_visible_mnt_ns();
 	if (!visible_ns) {
-		return 0;
+		return orig_ns;
 	}
 
 	if (orig_ns == &visible_ns->ns) {
 		put_mnt_ns(visible_ns);
-		return 0;
+		return orig_ns;
 	}
 
 	put_mnt_ns(ksu_susfs_to_mnt_ns(orig_ns));
-	PT_REGS_RC(regs) = (unsigned long)&visible_ns->ns;
+	return &visible_ns->ns;
+}
+
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+static struct ns_common *ksu_susfs_mntns_get_fast(struct task_struct *task)
+{
+	struct ns_common *orig_ns;
+
+	if (!ksu_susfs_orig_mntns_get) {
+		return NULL;
+	}
+
+	orig_ns = ksu_susfs_orig_mntns_get(task);
+	return ksu_susfs_handle_mntns_get(orig_ns);
+}
+
+static int ksu_susfs_patch_mntns_get(void)
+{
+	struct ns_common *(*new_get)(struct task_struct *task);
+	void *dst;
+
+	if (ksu_susfs_orig_mntns_get) {
+		return 0;
+	}
+
+	ksu_susfs_orig_mntns_get = mntns_operations.get;
+	new_get = ksu_susfs_mntns_get_fast;
+	dst = (void *)&((struct proc_ns_operations *)&mntns_operations)->get;
+	return ksu_patch_text(dst, &new_get, sizeof(new_get),
+			      KSU_PATCH_TEXT_FLUSH_DCACHE);
+}
+
+static void ksu_susfs_restore_mntns_get(void)
+{
+	struct ns_common *(*orig_get)(struct task_struct *task);
+	void *dst;
+
+	if (!ksu_susfs_orig_mntns_get) {
+		return;
+	}
+
+	orig_get = ksu_susfs_orig_mntns_get;
+	dst = (void *)&((struct proc_ns_operations *)&mntns_operations)->get;
+	if (ksu_patch_text(dst, &orig_get, sizeof(orig_get),
+			   KSU_PATCH_TEXT_FLUSH_DCACHE)) {
+		pr_err("susfs: failed to restore mntns get\n");
+	}
+
+	ksu_susfs_orig_mntns_get = NULL;
+}
+
+void ksu_susfs_set_mount_runtime_ready(bool ready)
+{
+	ksu_susfs_mount_runtime_ready = ready;
+}
+#endif
+
+static int ksu_susfs_mntns_get_handler(struct kretprobe_instance *ri,
+				       struct pt_regs *regs)
+{
+	PT_REGS_RC(regs) = (unsigned long)ksu_susfs_handle_mntns_get(
+		(struct ns_common *)regs_return_value(regs));
 	return 0;
 }
 
@@ -1270,6 +1336,42 @@ static int ksu_susfs_fdinfo_open(struct inode *inode, struct file *file)
 	return single_open(file, ksu_susfs_fdinfo_show, inode);
 }
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+bool ksu_susfs_should_hide_new_vfsmount(void)
+{
+	return ksu_susfs_mount_should_mark_current();
+}
+
+bool ksu_susfs_should_hide_cloned_mount(struct mount *old)
+{
+	return ksu_susfs_mount_hidden_or_ancestor(old) ||
+	       ksu_susfs_mount_should_mark_current();
+}
+
+void ksu_susfs_mark_vfsmount_hidden(struct vfsmount *mnt, bool hide)
+{
+	if (!hide || IS_ERR_OR_NULL(mnt)) {
+		return;
+	}
+
+	ksu_susfs_mount_mark_hidden(real_mount(mnt));
+}
+
+void ksu_susfs_mark_mount_hidden(struct mount *mnt, bool hide)
+{
+	if (!hide || IS_ERR_OR_NULL(mnt)) {
+		return;
+	}
+
+	ksu_susfs_mount_mark_hidden(mnt);
+}
+
+void ksu_susfs_handle_cleanup_mnt(struct mount *mnt)
+{
+	ksu_susfs_mount_unmark_hidden(mnt);
+}
+#endif
+
 static int ksu_susfs_vfs_create_mount_entry(struct kretprobe_instance *ri,
 					    struct pt_regs *regs)
 {
@@ -1461,6 +1563,9 @@ static void ksu_susfs_mount_runtime_disable(void)
 		ksu_susfs_fdinfo_fops = NULL;
 	}
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+	ksu_susfs_restore_mntns_get();
+#endif
 	ksu_susfs_destroy_kretprobe(&ksu_susfs_vfs_create_mount_rp);
 	ksu_susfs_destroy_kretprobe(&ksu_susfs_clone_mnt_rp);
 	ksu_susfs_destroy_kretprobe(&ksu_susfs_mntns_get_rp);
@@ -1506,6 +1611,13 @@ static int ksu_susfs_mount_runtime_enable(void)
 		goto err_out;
 	}
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+	err = ksu_susfs_patch_mntns_get();
+	if (err) {
+		pr_warn("susfs: mnt namespace identity fast hook unavailable: %d\n",
+			err);
+	}
+#else
 	ksu_susfs_vfs_create_mount_rp = ksu_susfs_init_kretprobe(
 		"vfs_create_mount", ksu_susfs_vfs_create_mount_entry,
 		ksu_susfs_vfs_create_mount_handler,
@@ -1537,6 +1649,7 @@ static int ksu_susfs_mount_runtime_enable(void)
 	if (!ksu_susfs_mntns_get_rp) {
 		pr_warn("susfs: mnt namespace identity hook unavailable\n");
 	}
+#endif
 
 	addr = find_kernel_symbol_exact("proc_fdinfo_file_operations");
 	if (addr) {
@@ -1560,7 +1673,11 @@ static int ksu_susfs_mount_runtime_enable(void)
 				KSU_SUSFS_MOUNT_WINDOW_RETRY_DELAY_MS));
 	}
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+	ksu_susfs_mount_runtime_ready = false;
+#else
 	ksu_susfs_mount_runtime_ready = true;
+#endif
 	return 0;
 
 err_out:

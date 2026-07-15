@@ -574,33 +574,53 @@ static int ksu_susfs_kstat_vfs_getattr_entry(struct kretprobe_instance *ri,
 	return 0;
 }
 
-static int ksu_susfs_kstat_vfs_getattr_handler(struct kretprobe_instance *ri,
-					       struct pt_regs *regs)
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+void
+#else
+static void
+#endif
+ksu_susfs_handle_vfs_getattr_nosec(const struct path *path, struct kstat *stat,
+				   long ret)
 {
-	struct ksu_susfs_vfs_getattr_ctx *ctx =
-		(struct ksu_susfs_vfs_getattr_ctx *)ri->data;
 	struct inode *inode;
 	struct ksu_susfs_kstat_entry *entry;
 
-	if ((long)regs_return_value(regs) || !ksu_susfs_kstat_should_spoof_current()) {
-		return 0;
+	if (ret || !ksu_susfs_kstat_should_spoof_current()) {
+		return;
 	}
 
-	if (!ctx->path || !ctx->stat || !ctx->path->dentry) {
-		return 0;
+	if (!path || !stat || !path->dentry) {
+		return;
 	}
 
-	inode = d_backing_inode(ctx->path->dentry);
+	inode = d_backing_inode(path->dentry);
 	if (!inode) {
-		return 0;
+		return;
 	}
 
 	rcu_read_lock();
 	entry = ksu_susfs_kstat_lookup_rcu(inode->i_ino, inode->i_sb->s_dev);
 	if (entry) {
-		ksu_susfs_kstat_apply_spoof(entry, ctx->stat);
+		ksu_susfs_kstat_apply_spoof(entry, stat);
 	}
 	rcu_read_unlock();
+}
+
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+void ksu_susfs_set_getattr_ready(bool ready)
+{
+	ksu_susfs_getattr_ready = ready;
+}
+#endif
+
+static int ksu_susfs_kstat_vfs_getattr_handler(struct kretprobe_instance *ri,
+					       struct pt_regs *regs)
+{
+	struct ksu_susfs_vfs_getattr_ctx *ctx =
+		(struct ksu_susfs_vfs_getattr_ctx *)ri->data;
+
+	ksu_susfs_handle_vfs_getattr_nosec(ctx->path, ctx->stat,
+					   (long)regs_return_value(regs));
 
 	return 0;
 }
@@ -2726,6 +2746,9 @@ int ksu_susfs_kstat_init(void)
 	ksu_susfs_kstat_rule_count = 0;
 	ksu_susfs_sus_map_rule_count = 0;
 
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+	ksu_susfs_getattr_ready = false;
+#else
 	ksu_susfs_vfs_getattr_nosec_rp = ksu_susfs_init_kretprobe(
 		"vfs_getattr_nosec", ksu_susfs_kstat_vfs_getattr_entry,
 		ksu_susfs_kstat_vfs_getattr_handler,
@@ -2734,6 +2757,7 @@ int ksu_susfs_kstat_init(void)
 		return -ENOENT;
 	}
 	ksu_susfs_getattr_ready = true;
+#endif
 
 	addr = find_kernel_symbol_exact("proc_pid_maps_op");
 	if (addr) {

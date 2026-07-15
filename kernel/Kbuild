@@ -52,6 +52,9 @@ kernelsu-objs += hook/syscall_hook_manager.o
 kernelsu-objs += hook/tp_marker.o
 ifeq ($(CONFIG_ARM64),y)
 kernelsu-objs += hook/arm64/syscall_hook.o
+ifeq ($(CONFIG_KSU_HACK_ARM64_BRANCH_LINK),y)
+kernelsu-objs += hook/arm64/branch_link_hook.o
+endif
 else ifeq ($(CONFIG_X86_64),y)
 kernelsu-objs += hook/x86_64/syscall_hook.o
 endif
@@ -302,6 +305,14 @@ endif
 
 ifeq ($(shell grep -q "int\s\+path_umount" $(srctree)/fs/namespace.c; echo $$?),0)
 ccflags-y += -DKSU_HAS_PATH_UMOUNT
+endif
+
+# Some Android kernels backport faccessat2-style flags into do_faccessat()
+# without matching upstream version numbers.
+ifeq ($(shell grep -F "long do_faccessat" \
+	$(srctree)/fs/open.c 2>/dev/null | \
+	grep -Fq "flags"; echo $$?),0)
+ccflags-y += -DKSU_HAS_FACCESSAT2
 endif
 
 # seccomp_types.h was added in 6.7

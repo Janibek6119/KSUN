@@ -68,6 +68,20 @@ config KSU_TAMPER_SYSCALL_TABLE
 	  downstream KernelSU syscall-table tamper mode while reusing
 	  KernelSU-Next's central syscall handlers.
 
+config KSU_HACK_ARM64_BRANCH_LINK
+	bool "Experimental KernelSU ARM64 branch-link hook"
+	depends on KSU_KPROBES_HOOK && ARM64 && KALLSYMS
+	depends on !KSU_TAMPER_SYSCALL_TABLE
+	default n
+	help
+	  EXPERIMENTAL: patch selected ARM64 syscall callsites by rewriting
+	  branch-with-link instructions so sucompat/exec path handling can run
+	  without redirecting those syscalls through the tracepoint dispatcher.
+	  This is intended for Android ARM64 kernels with the standard syscall
+	  wrapper layout and should be validated on the target device. Module
+	  builds still require the hook text to land within the ARM64 BL
+	  +/-128 MiB range, otherwise patching will be refused at runtime.
+
 config KSU_KPROBES_SUSFS
 	bool "KernelSU hookless SUSFS"
 	depends on KSU && KSU != m && KSU_KPROBES_HOOK
@@ -92,5 +106,8 @@ config KSU_KPROBES_SUSFS
 	    (cmdline only on kernels without proc bootconfig)
 	  - spoof_uname
 	  - avc_log_spoofing
+	  When KSU_HACK_ARM64_BRANCH_LINK is enabled on ARM64, SUSFS uses
+	  direct branch-link/function-pointer hooks for kstat and mount
+	  tracking instead of installing its kprobe/kretprobe runtime hooks.
 
 endmenu

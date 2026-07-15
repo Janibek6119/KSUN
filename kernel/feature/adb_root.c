@@ -154,11 +154,26 @@ out_release_env_p:
     return ret;
 }
 
+static long ksu_adb_root_handle_execve_common(const char *filename,
+					      unsigned long *envp_p)
+{
+    long ret;
+
+    if (!static_branch_unlikely(&ksu_adb_root)) return 0;
+    if (!is_exec_adbd(filename)) return 0;
+    if (!is_libadbroot_ok()) return 0;
+
+    ret = setup_ld_preload(envp_p);
+    if (ret) return ret;
+
+    pr_info("escape to root for adb\n");
+    escape_to_root_for_adb_root();
+    return 0;
+}
+
 #ifdef CONFIG_KSU_KPROBES_HOOK
 long ksu_adb_root_handle_execve(struct pt_regs *regs)
 {
-    if (!static_branch_unlikely(&ksu_adb_root)) return 0;
-
     char __user *filename_user = (char __user *)PT_REGS_PARM1(regs);
     unsigned long *envp_p = (unsigned long *)&PT_REGS_PARM3(regs);
 
@@ -169,29 +184,16 @@ long ksu_adb_root_handle_execve(struct pt_regs *regs)
     long ret = strncpy_from_user(buf, fn, sizeof(buf));
     if (ret < kAdbdLen || ret >= sizeof(buf)) return 0;
 
-    if (!is_exec_adbd(buf)) return 0;
-    if (!is_libadbroot_ok()) return 0;
-
-    ret = setup_ld_preload(envp_p);
-    if (ret) return ret;
-
-    pr_info("escape to root for adb\n");
-    escape_to_root_for_adb_root();
-    return 0;
+    return ksu_adb_root_handle_execve_common(buf, envp_p);
 }
-#else
-long ksu_adb_root_handle_execve(const char *filename, struct user_arg_ptr *envp)
+#endif
+
+#if !defined(CONFIG_KSU_KPROBES_HOOK) || defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
+long ksu_adb_root_handle_execveat(const char *filename,
+				  struct user_arg_ptr *envp)
 {
-    if (!static_branch_unlikely(&ksu_adb_root)) return 0;
-    if (!is_exec_adbd(filename)) return 0;
-    if (!is_libadbroot_ok()) return 0;
-
-    long ret = setup_ld_preload((unsigned long *)&(envp->ptr.native));
-    if (ret) return ret;
-
-    pr_info("escape to root for adb (via Syscall Hook)\n");
-    escape_to_root_for_adb_root();
-    return 0;
+    return ksu_adb_root_handle_execve_common(
+        filename, (unsigned long *)&(envp->ptr.native));
 }
 #endif
 
