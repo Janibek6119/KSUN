@@ -797,7 +797,7 @@ static int ksu_selinux_hide_enable(void)
 
     hook_selinux_status();
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) && !defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)
     fake_state.initialized = true;
     fake_state.ss = kzalloc(sizeof(*fake_state.ss), GFP_KERNEL);
