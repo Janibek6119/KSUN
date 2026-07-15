@@ -134,6 +134,14 @@ ifeq ($(shell grep -q "show_map_pad_vma" \
 	$(srctree)/include/linux/pgsize_migration.h 2>/dev/null; echo $$?),0)
 ccflags-y += -DKSU_SUSFS_HAS_PGSIZE_MIGRATION
 endif
+ifeq ($(shell grep -Fq "struct vm_area_struct *pad" \
+	$(srctree)/include/linux/pgsize_migration.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_SHOW_MAP_PAD_VMA_HAS_PAD
+endif
+ifeq ($(shell grep -q "get_data_vma" \
+	$(srctree)/include/linux/pgsize_migration.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_PGSIZE_MIGRATION_VMA_ACCESSORS
+endif
 ifeq ($(shell grep -q "vma_get_anon_name" \
 	$(wildcard $(srctree)/include/linux/mm_types.h \
 		$(srctree)/include/linux/mm.h) \
@@ -169,11 +177,21 @@ ifeq ($(shell grep -q "seq_put_decimal_ull_width" \
 	$(srctree)/include/linux/seq_file.h 2>/dev/null; echo $$?),0)
 ccflags-y += -DKSU_SUSFS_HAS_SEQ_PUT_DECIMAL_ULL_WIDTH
 endif
+ifeq ($(shell grep -Eq '[[:space:]]version[[:space:]]*;' \
+	$(srctree)/include/linux/seq_file.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_SEQ_FILE_HAS_VERSION
+endif
 ifeq ($(shell grep -q "struct mm_walk_ops" \
 	$(wildcard $(srctree)/include/linux/pagewalk.h \
 		$(srctree)/include/linux/mm.h) \
 	2>/dev/null; echo $$?),0)
 ccflags-y += -DKSU_SUSFS_HAS_MM_WALK_OPS
+endif
+ifeq ($(shell grep -Eq 'int[[:space:]]+depth,[[:space:]]*struct[[:space:]]+mm_walk' \
+	$(wildcard $(srctree)/include/linux/pagewalk.h \
+		$(srctree)/include/linux/mm.h) \
+	2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_PTE_HOLE_HAS_DEPTH
 endif
 ifeq ($(shell grep -q "compound_nr" \
 	$(srctree)/include/linux/mm.h 2>/dev/null; echo $$?),0)
@@ -186,6 +204,34 @@ endif
 ifeq ($(shell grep -q "is_device_private_entry" \
 	$(srctree)/include/linux/swapops.h 2>/dev/null; echo $$?),0)
 ccflags-y += -DKSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
+endif
+ifeq ($(shell grep -q "pfn_swap_entry_to_page" \
+	$(srctree)/include/linux/swapops.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_PFN_SWAP_ENTRY_TO_PAGE
+endif
+ifeq ($(shell grep -q "is_pfn_swap_entry" \
+	$(srctree)/include/linux/swapops.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_IS_PFN_SWAP_ENTRY
+endif
+ifeq ($(shell grep -q "migration_entry_to_page" \
+	$(srctree)/include/linux/swapops.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_MIGRATION_ENTRY_TO_PAGE
+endif
+ifeq ($(shell grep -q "device_private_entry_to_page" \
+	$(srctree)/include/linux/swapops.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY_TO_PAGE
+endif
+ifeq ($(shell grep -q "xa_load" \
+	$(srctree)/include/linux/xarray.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_XA_LOAD
+endif
+ifeq ($(shell grep -q "find_get_entry" \
+	$(srctree)/include/linux/pagemap.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_FIND_GET_ENTRY
+endif
+ifeq ($(shell grep -q "files_lookup_fd_locked" \
+	$(srctree)/include/linux/fdtable.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_FILES_LOOKUP_FD_LOCKED
 endif
 ifneq ($(wildcard $(srctree)/include/linux/generic-radix-tree.h),)
 ccflags-y += -DKSU_SUSFS_HAS_GENERIC_RADIX_TREE

@@ -5,10 +5,18 @@
 #include <linux/hugetlb.h>
 #include <linux/jump_label.h>
 #include <linux/mm.h>
+#include <linux/pagemap.h>
 #include <linux/ptrace.h>
 #include <linux/radix-tree.h>
 #include <linux/rwsem.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
+
+#if defined(KSU_SUSFS_HAS_XA_IS_VALUE) || defined(KSU_SUSFS_HAS_XA_LOAD)
+#include <linux/xarray.h>
+#endif
 
 #ifdef KSU_SUSFS_HAS_SCHED_MM
 #include <linux/sched/mm.h>
@@ -182,17 +190,116 @@ ksu_susfs_vma_pad_start(struct vm_area_struct *vma)
 #endif
 }
 
+static inline struct vm_area_struct *
+ksu_susfs_get_data_vma(struct vm_area_struct *vma)
+{
+#if defined(KSU_SUSFS_HAS_PGSIZE_MIGRATION) && \
+	defined(KSU_SUSFS_SHOW_MAP_PAD_VMA_HAS_PAD) && \
+	defined(KSU_SUSFS_HAS_PGSIZE_MIGRATION_VMA_ACCESSORS)
+	return get_data_vma(vma);
+#else
+	return vma;
+#endif
+}
+
+static inline struct vm_area_struct *
+ksu_susfs_get_pad_vma(struct vm_area_struct *vma)
+{
+#if defined(KSU_SUSFS_HAS_PGSIZE_MIGRATION) && \
+	defined(KSU_SUSFS_SHOW_MAP_PAD_VMA_HAS_PAD) && \
+	defined(KSU_SUSFS_HAS_PGSIZE_MIGRATION_VMA_ACCESSORS)
+	return get_pad_vma(vma);
+#else
+	(void)vma;
+	return NULL;
+#endif
+}
+
+static inline void ksu_susfs_put_data_vma(struct vm_area_struct *orig,
+					  struct vm_area_struct *data)
+{
+#if defined(KSU_SUSFS_HAS_PGSIZE_MIGRATION) && \
+	defined(KSU_SUSFS_SHOW_MAP_PAD_VMA_HAS_PAD) && \
+	defined(KSU_SUSFS_HAS_PGSIZE_MIGRATION_VMA_ACCESSORS)
+	if (data != orig) {
+		kfree(data);
+	}
+#else
+	(void)orig;
+	(void)data;
+#endif
+}
+
 static inline void ksu_susfs_show_map_pad_vma(struct vm_area_struct *vma,
+					       struct vm_area_struct *pad,
 					       struct seq_file *m, void *show,
 					       bool smaps)
 {
 #ifdef KSU_SUSFS_HAS_PGSIZE_MIGRATION
+#ifdef KSU_SUSFS_SHOW_MAP_PAD_VMA_HAS_PAD
+	show_map_pad_vma(vma, pad, m, show, smaps);
+#else
+	(void)pad;
 	show_map_pad_vma(vma, m, show, smaps);
+#endif
 #else
 	(void)vma;
+	(void)pad;
 	(void)m;
 	(void)show;
 	(void)smaps;
+#endif
+}
+
+static inline bool ksu_susfs_is_pfn_swap_entry(swp_entry_t entry)
+{
+#ifdef KSU_SUSFS_HAS_IS_PFN_SWAP_ENTRY
+	return is_pfn_swap_entry(entry);
+#else
+	if (is_migration_entry(entry)) {
+		return true;
+	}
+#ifdef KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
+	return is_device_private_entry(entry);
+#else
+	return false;
+#endif
+#endif
+}
+
+static inline struct page *ksu_susfs_pfn_swap_entry_to_page(swp_entry_t entry)
+{
+#ifdef KSU_SUSFS_HAS_PFN_SWAP_ENTRY_TO_PAGE
+	return pfn_swap_entry_to_page(entry);
+#else
+#ifdef KSU_SUSFS_HAS_MIGRATION_ENTRY_TO_PAGE
+	if (is_migration_entry(entry)) {
+		return migration_entry_to_page(entry);
+	}
+#endif
+#if defined(KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY) && \
+	defined(KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY_TO_PAGE)
+	if (is_device_private_entry(entry)) {
+		return device_private_entry_to_page(entry);
+	}
+#endif
+	return NULL;
+#endif
+}
+
+static inline void *ksu_susfs_find_shmem_swap_entry(
+	struct address_space *mapping, pgoff_t index, bool *needs_put)
+{
+	*needs_put = false;
+
+#ifdef KSU_SUSFS_HAS_XA_LOAD
+	return xa_load(&mapping->i_pages, index);
+#elif defined(KSU_SUSFS_HAS_FIND_GET_ENTRY)
+	*needs_put = true;
+	return find_get_entry(mapping, index);
+#else
+	*needs_put = true;
+	return find_get_page(mapping, index);
 #endif
 }
 

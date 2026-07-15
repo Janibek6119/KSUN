@@ -1116,11 +1116,16 @@ ksu_susfs_m_next_vma(struct proc_maps_private *priv, struct vm_area_struct *vma)
 
 static void ksu_susfs_m_cache_vma(struct seq_file *m, struct vm_area_struct *vma)
 {
+#ifdef KSU_SUSFS_SEQ_FILE_HAS_VERSION
 	if (m->count < m->size) {
 		m->version = ksu_susfs_m_next_vma(m->private, vma) ?
 				    vma->vm_end :
 				    -1UL;
 	}
+#else
+	(void)m;
+	(void)vma;
+#endif
 }
 
 static int ksu_susfs_is_stack(struct vm_area_struct *vma)
@@ -1295,20 +1300,30 @@ done:
 
 static int ksu_susfs_show_map(struct seq_file *m, void *v)
 {
-	struct vm_area_struct *vma = v;
+	struct vm_area_struct *orig_vma = v;
+	struct vm_area_struct *pad_vma;
+	struct vm_area_struct *vma;
 
 	if (!ksu_susfs_proc_maps_view_enabled_current()) {
 		return ksu_susfs_orig_maps_show ? ksu_susfs_orig_maps_show(m, v) :
 						 -ENOSYS;
 	}
 
+	vma = ksu_susfs_get_data_vma(orig_vma);
+	if (ksu_susfs_sus_map_match_vma(vma)) {
+		ksu_susfs_m_cache_vma(m, orig_vma);
+		ksu_susfs_put_data_vma(orig_vma, vma);
+		return 0;
+	}
+
+	pad_vma = ksu_susfs_get_pad_vma(orig_vma);
 	if (vma_pages(vma)) {
 		ksu_susfs_show_map_vma(m, vma);
 	}
 
-	ksu_susfs_show_map_pad_vma(vma, m,
+	ksu_susfs_show_map_pad_vma(vma, pad_vma, m,
 				   (void *)ksu_susfs_show_map_vma, false);
-	ksu_susfs_m_cache_vma(m, vma);
+	ksu_susfs_m_cache_vma(m, orig_vma);
 	return 0;
 }
 
@@ -1404,7 +1419,8 @@ static void ksu_susfs_rewrite_smap_prefix(struct seq_file *m,
 
 static int ksu_susfs_show_smap(struct seq_file *m, void *v)
 {
-	struct vm_area_struct *vma = v;
+	struct vm_area_struct *orig_vma = v;
+	struct vm_area_struct *vma;
 	size_t start = m->count;
 	int ret;
 
@@ -1413,25 +1429,31 @@ static int ksu_susfs_show_smap(struct seq_file *m, void *v)
 						  -ENOSYS;
 	}
 
+	vma = ksu_susfs_get_data_vma(orig_vma);
 	if (ksu_susfs_sus_map_match_vma(vma)) {
-		ksu_susfs_m_cache_vma(m, vma);
+		ksu_susfs_m_cache_vma(m, orig_vma);
+		ksu_susfs_put_data_vma(orig_vma, vma);
 		return 0;
 	}
 
 	if (!ksu_susfs_orig_smaps_show) {
+		ksu_susfs_put_data_vma(orig_vma, vma);
 		return -ENOSYS;
 	}
 
 	ret = ksu_susfs_orig_smaps_show(m, v);
 	if (ret || seq_has_overflowed(m)) {
+		ksu_susfs_put_data_vma(orig_vma, vma);
 		return ret;
 	}
 
 	if (!vma || !vma->vm_file) {
+		ksu_susfs_put_data_vma(orig_vma, vma);
 		return ret;
 	}
 
 	ksu_susfs_rewrite_smap_prefix(m, vma, start);
+	ksu_susfs_put_data_vma(orig_vma, vma);
 	return ret;
 }
 
@@ -1512,10 +1534,16 @@ static void ksu_susfs_smaps_account(struct ksu_susfs_mem_size_stats *mss,
 
 #ifdef CONFIG_SHMEM
 static int ksu_susfs_smaps_pte_hole(unsigned long addr, unsigned long end,
+#ifdef KSU_SUSFS_PTE_HOLE_HAS_DEPTH
+				    int depth,
+#endif
 				    struct mm_walk *walk)
 {
 	struct ksu_susfs_mem_size_stats *mss = walk->private;
 
+#ifdef KSU_SUSFS_PTE_HOLE_HAS_DEPTH
+	(void)depth;
+#endif
 	mss->swap += shmem_partial_swap_usage(walk->vma->vm_file->f_mapping,
 					      addr, end);
 	return 0;
@@ -1552,24 +1580,23 @@ static void ksu_susfs_smaps_pte_entry(pte_t *pte, unsigned long addr,
 				mss->swap_pss += (u64)PAGE_SIZE
 						 << KSU_SUSFS_PSS_SHIFT;
 			}
-		} else if (is_migration_entry(swpent)) {
-			page = migration_entry_to_page(swpent);
-#ifdef KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
-		} else if (is_device_private_entry(swpent)) {
-			page = device_private_entry_to_page(swpent);
-#endif
+		} else if (ksu_susfs_is_pfn_swap_entry(swpent)) {
+			page = ksu_susfs_pfn_swap_entry_to_page(swpent);
 		}
 	} else if (unlikely(IS_ENABLED(CONFIG_SHMEM) &&
 			    mss->check_shmem_swap && pte_none(*pte))) {
-		page = find_get_entry(vma->vm_file->f_mapping,
-				      linear_page_index(vma, addr));
+		bool needs_put = false;
+
+		page = ksu_susfs_find_shmem_swap_entry(
+			vma->vm_file->f_mapping, linear_page_index(vma, addr),
+			&needs_put);
 		if (!page) {
 			return;
 		}
 
 		if (ksu_susfs_pagecache_is_value(page)) {
 			mss->swap += PAGE_SIZE;
-		} else {
+		} else if (needs_put) {
 			put_page(page);
 		}
 		return;
@@ -1659,12 +1686,8 @@ static int ksu_susfs_smaps_hugetlb_range(pte_t *pte, unsigned long hmask,
 	} else if (is_swap_pte(*pte)) {
 		swp_entry_t swpent = pte_to_swp_entry(*pte);
 
-		if (is_migration_entry(swpent)) {
-			page = migration_entry_to_page(swpent);
-#ifdef KSU_SUSFS_HAS_DEVICE_PRIVATE_ENTRY
-		} else if (is_device_private_entry(swpent)) {
-			page = device_private_entry_to_page(swpent);
-#endif
+		if (ksu_susfs_is_pfn_swap_entry(swpent)) {
+			page = ksu_susfs_pfn_swap_entry_to_page(swpent);
 		}
 	}
 

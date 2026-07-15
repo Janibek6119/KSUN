@@ -1264,6 +1264,30 @@ static int ksu_susfs_fdinfo_show(struct seq_file *m, void *v)
 		return -ENOENT;
 	}
 
+#ifdef KSU_SUSFS_HAS_FILES_LOOKUP_FD_LOCKED
+	task_lock(task);
+	files = task->files;
+	if (files) {
+		unsigned int fd = proc_fd(m->private);
+
+		spin_lock(&files->file_lock);
+		file = files_lookup_fd_locked(files, fd);
+		if (file) {
+			struct fdtable *fdt = files_fdtable(files);
+
+			f_flags = file->f_flags;
+			if (close_on_exec(fd, fdt)) {
+				f_flags |= O_CLOEXEC;
+			}
+
+			get_file(file);
+			ret = 0;
+		}
+		spin_unlock(&files->file_lock);
+	}
+	task_unlock(task);
+	put_task_struct(task);
+#else
 	files = get_files_struct(task);
 	put_task_struct(task);
 
@@ -1285,11 +1309,14 @@ static int ksu_susfs_fdinfo_show(struct seq_file *m, void *v)
 		}
 		spin_unlock(&files->file_lock);
 	}
+#endif
 
 	if (ret) {
+#ifndef KSU_SUSFS_HAS_FILES_LOOKUP_FD_LOCKED
 		if (files) {
 			put_files_struct(files);
 		}
+#endif
 		return ret;
 	}
 
@@ -1316,9 +1343,11 @@ out_tail:
 		file->f_op->show_fdinfo(m, file);
 	}
 
+#ifndef KSU_SUSFS_HAS_FILES_LOOKUP_FD_LOCKED
 	if (files) {
 		put_files_struct(files);
 	}
+#endif
 	fput(file);
 	return 0;
 }
