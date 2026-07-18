@@ -56,5 +56,8 @@ void ksu_susfs_exit(void);
 bool ksu_susfs_handle_compat(unsigned int cmd, void __user *arg);
 void ksu_susfs_apply_default_rules(void);
 void ksu_susfs_handle_boot_completed(void);
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+int ksu_susfs_attach_nomount_parent(const char *path);
+#endif
 
 #endif // __KSU_H_SUSFS

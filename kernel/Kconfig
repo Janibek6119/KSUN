@@ -110,4 +110,21 @@ config KSU_KPROBES_SUSFS
 	  direct branch-link/function-pointer hooks for kstat and mount
 	  tracking instead of installing its kprobe/kretprobe runtime hooks.
 
+config KSU_KPROBES_NOMOUNT
+	bool "KernelSU hookless NoMount"
+	depends on KSU_KPROBES_SUSFS
+	depends on NET
+	default y
+	help
+	  Enable a KernelSU-hosted NoMount-compatible VFS redirection
+	  bridge. This keeps NoMount out of fs/ and reuses the hookless
+	  SUSFS VFS shadow engine, while preserving the Generic Netlink
+	  family and command ABI used by the existing nm userspace tool.
+
+	  This implementation supports exact child injection, replacement,
+	  whiteout, synthetic intermediate virtual directories, UID
+	  blocking, rule listing, and clear commands. It intentionally
+	  avoids NoMount's separate inode/superblock wrapper stack so SUSFS
+	  and NoMount do not compete over the same VFS operation tables.
+
 endmenu

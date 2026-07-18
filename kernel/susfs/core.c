@@ -30,6 +30,9 @@
 #include "susfs/kstat.h"
 #include "susfs/procfs.h"
 #include "susfs/susfs.h"
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+#include "nomount/nomount.h"
+#endif
 
 #define KSU_SUSFS_HASH_BITS 8
 #define KSU_SUSFS_SB_HASH_BITS 4
@@ -49,6 +52,11 @@ enum ksu_susfs_rule_type {
 struct ksu_susfs_redirect_priv {
 	struct inode *backend_inode;
 	char backend_path[KSU_SUSFS_MAX_PATHNAME];
+	char visible_path[KSU_SUSFS_MAX_PATHNAME];
+};
+
+struct ksu_susfs_file_proxy {
+	struct file *backend_file;
 };
 
 struct ksu_susfs_rule {
@@ -109,7 +117,18 @@ struct ksu_susfs_proxy_ctx {
 	struct dir_context ctx;
 	struct dir_context *orig_ctx;
 	struct ksu_susfs_parent *parent;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	bool nomount_active;
+#endif
 };
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+struct ksu_susfs_redirect_proxy_ctx {
+	struct dir_context ctx;
+	struct dir_context *orig_ctx;
+	const char *visible_path;
+};
+#endif
 
 static DEFINE_HASHTABLE(ksu_susfs_rules_ht, KSU_SUSFS_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_susfs_parents_ht, KSU_SUSFS_HASH_BITS);
@@ -375,30 +394,292 @@ ksu_susfs_backend_priv(struct inode *inode)
 	return inode->i_private;
 }
 
-static int ksu_susfs_file_open(struct inode *inode, struct file *file)
+static struct file *ksu_susfs_proxy_backend_file(struct file *file)
 {
-	struct inode *backend_inode = ksu_susfs_backend_inode(inode);
+	struct ksu_susfs_file_proxy *proxy = file->private_data;
 
-	if (!backend_inode || !backend_inode->i_fop) {
+	return proxy ? proxy->backend_file : NULL;
+}
+
+static loff_t ksu_susfs_proxy_llseek(struct file *file, loff_t offset,
+				      int whence)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+	loff_t ret;
+
+	if (!backend_file) {
+		return -EIO;
+	}
+
+	ret = vfs_llseek(backend_file, offset, whence);
+	if (ret >= 0) {
+		file->f_pos = ret;
+	}
+
+	return ret;
+}
+
+static ssize_t ksu_susfs_proxy_read(struct file *file, char __user *buf,
+				    size_t count, loff_t *pos)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file) {
+		return -EIO;
+	}
+
+	return vfs_read(backend_file, buf, count, pos);
+}
+
+static ssize_t ksu_susfs_proxy_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *pos)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file) {
+		return -EIO;
+	}
+
+	return vfs_write(backend_file, buf, count, pos);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
+static __poll_t ksu_susfs_proxy_poll(struct file *file,
+				     struct poll_table_struct *wait)
+#else
+static unsigned int ksu_susfs_proxy_poll(struct file *file,
+					 struct poll_table_struct *wait)
+#endif
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->poll) {
+		return 0;
+	}
+
+	return backend_file->f_op->poll(backend_file, wait);
+}
+
+static long ksu_susfs_proxy_unlocked_ioctl(struct file *file, unsigned int cmd,
+					   unsigned long arg)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op ||
+	    !backend_file->f_op->unlocked_ioctl) {
+		return -ENOTTY;
+	}
+
+	return backend_file->f_op->unlocked_ioctl(backend_file, cmd, arg);
+}
+
+#ifdef CONFIG_COMPAT
+static long ksu_susfs_proxy_compat_ioctl(struct file *file, unsigned int cmd,
+					 unsigned long arg)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op ||
+	    !backend_file->f_op->compat_ioctl) {
+		return -ENOTTY;
+	}
+
+	return backend_file->f_op->compat_ioctl(backend_file, cmd, arg);
+}
+#endif
+
+static int ksu_susfs_proxy_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->mmap) {
 		return -ENODEV;
 	}
 
-	if (file->f_mode & (FMODE_WRITE | FMODE_PWRITE)) {
-		atomic_inc(&backend_inode->i_writecount);
-		atomic_dec(&inode->i_writecount);
+	return backend_file->f_op->mmap(backend_file, vma);
+}
+
+static int ksu_susfs_proxy_flush(struct file *file, fl_owner_t id)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->flush) {
+		return 0;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-	if (file->f_mode & FMODE_READ) {
-		atomic_inc(&backend_inode->i_readcount);
-		atomic_dec(&inode->i_readcount);
+	return backend_file->f_op->flush(backend_file, id);
+}
+
+static int ksu_susfs_proxy_fsync(struct file *file, loff_t start, loff_t end,
+				 int datasync)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->fsync) {
+		return -EINVAL;
 	}
+
+	return backend_file->f_op->fsync(backend_file, start, end, datasync);
+}
+
+static int ksu_susfs_proxy_fasync(int fd, struct file *file, int on)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->fasync) {
+		return -EINVAL;
+	}
+
+	return backend_file->f_op->fasync(fd, backend_file, on);
+}
+
+static int ksu_susfs_proxy_lock(struct file *file, int cmd,
+				struct file_lock *fl)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->lock) {
+		return -EINVAL;
+	}
+
+	return backend_file->f_op->lock(backend_file, cmd, fl);
+}
+
+static int ksu_susfs_proxy_flock(struct file *file, int cmd,
+				 struct file_lock *fl)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op || !backend_file->f_op->flock) {
+		return -EINVAL;
+	}
+
+	return backend_file->f_op->flock(backend_file, cmd, fl);
+}
+
+static ssize_t ksu_susfs_proxy_splice_read(struct file *file, loff_t *ppos,
+					   struct pipe_inode_info *pipe,
+					   size_t len, unsigned int flags)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op ||
+	    !backend_file->f_op->splice_read) {
+		return -EINVAL;
+	}
+
+	return backend_file->f_op->splice_read(backend_file, ppos, pipe, len,
+					       flags);
+}
+
+static ssize_t ksu_susfs_proxy_splice_write(struct pipe_inode_info *pipe,
+					    struct file *file, loff_t *ppos,
+					    size_t len, unsigned int flags)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op ||
+	    !backend_file->f_op->splice_write) {
+		return -EINVAL;
+	}
+
+	return backend_file->f_op->splice_write(pipe, backend_file, ppos, len,
+						flags);
+}
+
+static long ksu_susfs_proxy_fallocate(struct file *file, int mode,
+				      loff_t offset, loff_t len)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (!backend_file || !backend_file->f_op ||
+	    !backend_file->f_op->fallocate) {
+		return -EOPNOTSUPP;
+	}
+
+	return backend_file->f_op->fallocate(backend_file, mode, offset, len);
+}
+
+static void ksu_susfs_proxy_show_fdinfo(struct seq_file *m, struct file *file)
+{
+	struct file *backend_file = ksu_susfs_proxy_backend_file(file);
+
+	if (backend_file && backend_file->f_op && backend_file->f_op->show_fdinfo) {
+		backend_file->f_op->show_fdinfo(m, backend_file);
+	}
+}
+
+static int ksu_susfs_proxy_release(struct inode *inode, struct file *file)
+{
+	struct ksu_susfs_file_proxy *proxy = file->private_data;
+
+	if (proxy) {
+		if (proxy->backend_file) {
+			fput(proxy->backend_file);
+		}
+		kfree(proxy);
+		file->private_data = NULL;
+	}
+
+	return 0;
+}
+
+static const struct file_operations ksu_susfs_proxy_file_fops = {
+	.llseek = ksu_susfs_proxy_llseek,
+	.read = ksu_susfs_proxy_read,
+	.write = ksu_susfs_proxy_write,
+	.poll = ksu_susfs_proxy_poll,
+	.unlocked_ioctl = ksu_susfs_proxy_unlocked_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = ksu_susfs_proxy_compat_ioctl,
 #endif
+	.mmap = ksu_susfs_proxy_mmap,
+	.flush = ksu_susfs_proxy_flush,
+	.release = ksu_susfs_proxy_release,
+	.fsync = ksu_susfs_proxy_fsync,
+	.fasync = ksu_susfs_proxy_fasync,
+	.lock = ksu_susfs_proxy_lock,
+	.flock = ksu_susfs_proxy_flock,
+	.splice_read = ksu_susfs_proxy_splice_read,
+	.splice_write = ksu_susfs_proxy_splice_write,
+	.fallocate = ksu_susfs_proxy_fallocate,
+	.show_fdinfo = ksu_susfs_proxy_show_fdinfo,
+};
 
-	file->f_inode = backend_inode;
-	file->f_mapping = backend_inode->i_mapping;
-	file->f_op = backend_inode->i_fop;
+static int ksu_susfs_file_open(struct inode *inode, struct file *file)
+{
+	struct ksu_susfs_redirect_priv *priv = ksu_susfs_backend_priv(inode);
+	struct ksu_susfs_file_proxy *proxy;
+	struct file *backend_file;
+	const struct cred *saved = NULL;
+	int flags;
 
+	if (!priv || !priv->backend_inode || !priv->backend_inode->i_fop) {
+		return -ENODEV;
+	}
+
+	proxy = kzalloc(sizeof(*proxy), GFP_KERNEL);
+	if (!proxy) {
+		return -ENOMEM;
+	}
+
+	flags = file->f_flags;
+	if (ksu_cred) {
+		saved = override_creds(ksu_cred);
+	}
+	backend_file = filp_open(priv->backend_path, flags, 0);
+	if (saved) {
+		revert_creds(saved);
+	}
+	if (IS_ERR(backend_file)) {
+		kfree(proxy);
+		return PTR_ERR(backend_file);
+	}
+
+	proxy->backend_file = backend_file;
+	file->private_data = proxy;
+	file->f_mapping = backend_file->f_mapping;
+	replace_fops(file, fops_get(&ksu_susfs_proxy_file_fops));
 	return 0;
 }
 
@@ -448,13 +729,70 @@ static int ksu_susfs_call_iterate(const struct file_operations *fops,
 	return -ENOTDIR;
 }
 
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+static KSU_SUSFS_ACTOR_RET
+ksu_susfs_redirect_actor_proxy(struct dir_context *ctx, const char *name,
+			       int namelen, loff_t offset, u64 ino,
+			       unsigned int d_type)
+{
+	struct ksu_susfs_redirect_proxy_ctx *proxy =
+		container_of(ctx, struct ksu_susfs_redirect_proxy_ctx, ctx);
+	KSU_SUSFS_ACTOR_RET ret;
+
+	if (ksu_nomount_filter_child(proxy->visible_path, name, namelen)) {
+		return KSU_SUSFS_ACTOR_CONTINUE;
+	}
+
+	proxy->orig_ctx->pos = proxy->ctx.pos;
+	ret = proxy->orig_ctx->actor(proxy->orig_ctx, name, namelen, offset, ino,
+				     d_type);
+	proxy->ctx.pos = proxy->orig_ctx->pos;
+	return ret;
+}
+#endif
+
 static int ksu_susfs_dir_iterate_shared(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
 	struct inode *backend_inode = ksu_susfs_backend_inode(inode);
+	struct ksu_susfs_redirect_priv *priv = ksu_susfs_backend_priv(inode);
 	int ret = -ENOTDIR;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	bool nomount_active = false;
+#endif
 
 	if (backend_inode && backend_inode->i_fop) {
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+		if (priv && ksu_nomount_dir_is_internal(priv->visible_path)) {
+			ksu_nomount_emit_children(priv->visible_path, ctx);
+			return 0;
+		}
+
+			nomount_active = priv && ksu_nomount_parent_active(priv->visible_path);
+			if (nomount_active) {
+				struct ksu_susfs_redirect_proxy_ctx proxy_ctx;
+
+				if (ksu_nomount_pos_is_magic(ctx->pos)) {
+					ksu_nomount_emit_children(priv->visible_path, ctx);
+					return 0;
+				}
+
+				memset(&proxy_ctx, 0, sizeof(proxy_ctx));
+				proxy_ctx.ctx.actor = ksu_susfs_redirect_actor_proxy;
+				proxy_ctx.ctx.pos = ctx->pos;
+				proxy_ctx.orig_ctx = ctx;
+			proxy_ctx.visible_path = priv->visible_path;
+			file->f_inode = backend_inode;
+			ret = ksu_susfs_call_iterate(backend_inode->i_fop, file,
+						     &proxy_ctx.ctx);
+			file->f_inode = inode;
+			ctx->pos = proxy_ctx.ctx.pos;
+			if (ret >= 0) {
+				ksu_nomount_emit_children(priv->visible_path, ctx);
+			}
+			return ret;
+		}
+#endif
 		file->f_inode = backend_inode;
 		ret = ksu_susfs_call_iterate(backend_inode->i_fop, file, ctx);
 		file->f_inode = inode;
@@ -466,18 +804,7 @@ static int ksu_susfs_dir_iterate_shared(struct file *file, struct dir_context *c
 #ifdef KSU_SUSFS_HAS_ITERATE
 static int ksu_susfs_dir_iterate(struct file *file, struct dir_context *ctx)
 {
-	struct inode *inode = file_inode(file);
-	struct inode *backend_inode = ksu_susfs_backend_inode(inode);
-	int ret = -ENOTDIR;
-
-	if (backend_inode && backend_inode->i_fop &&
-	    backend_inode->i_fop->iterate) {
-		file->f_inode = backend_inode;
-		ret = backend_inode->i_fop->iterate(file, ctx);
-		file->f_inode = inode;
-	}
-
-	return ret;
+	return ksu_susfs_dir_iterate_shared(file, ctx);
 }
 #endif
 
@@ -583,6 +910,23 @@ static ssize_t ksu_susfs_file_listxattr(struct dentry *dentry, char *buffer,
 	return ret;
 }
 
+static const char *ksu_susfs_symlink_get_link(struct dentry *dentry,
+					      struct inode *inode,
+					      struct delayed_call *done)
+{
+	struct inode *backend_inode = ksu_susfs_backend_inode(inode);
+
+	if (!dentry) {
+		return ERR_PTR(-ECHILD);
+	}
+
+	if (backend_inode && backend_inode->i_op && backend_inode->i_op->get_link) {
+		return backend_inode->i_op->get_link(dentry, backend_inode, done);
+	}
+
+	return ERR_PTR(-EINVAL);
+}
+
 static int ksu_susfs_build_child_path(const char *parent, const struct qstr *name,
 				      char *out, size_t out_size)
 {
@@ -614,6 +958,7 @@ static int ksu_susfs_build_child_path(const char *parent, const struct qstr *nam
 static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 						     struct inode *backend_inode,
 						     const char *backend_path,
+						     const char *visible_path,
 						     u32 ino_seed);
 
 static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *dentry,
@@ -622,12 +967,73 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 	struct ksu_susfs_redirect_priv *priv = ksu_susfs_backend_priv(dir);
 	struct path backend_path;
 	struct inode *inode;
+	char visible_child_path[KSU_SUSFS_MAX_PATHNAME];
 	char child_path[KSU_SUSFS_MAX_PATHNAME];
 	int err;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	unsigned int nomount_type;
+	unsigned long nomount_ino;
+	struct inode *nomount_inode = NULL;
+	int nomount_match;
+#endif
 
 	if (!priv || !priv->backend_inode || !S_ISDIR(priv->backend_inode->i_mode)) {
 		return ERR_PTR(-ENOTDIR);
 	}
+
+	err = ksu_susfs_build_child_path(priv->visible_path, &dentry->d_name,
+					 visible_child_path,
+					 sizeof(visible_child_path));
+	if (err) {
+		return ERR_PTR(err);
+	}
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	nomount_match = ksu_nomount_lookup_child(
+		priv->visible_path, dentry->d_name.name, dentry->d_name.len,
+		child_path, sizeof(child_path), &nomount_inode, &nomount_ino,
+		&nomount_type);
+	if (nomount_match == KSU_NOMOUNT_LOOKUP_WHITEOUT) {
+		d_add(dentry, NULL);
+		return NULL;
+	}
+	if (nomount_match == KSU_NOMOUNT_LOOKUP_REDIRECT) {
+		if (nomount_type != DT_REG && nomount_type != DT_DIR &&
+		    nomount_type != DT_LNK) {
+			if (nomount_inode) {
+				iput(nomount_inode);
+			}
+			return ERR_PTR(-EOPNOTSUPP);
+		}
+
+		inode = nomount_inode;
+		if (!inode || (!S_ISREG(inode->i_mode) &&
+			       !S_ISDIR(inode->i_mode) &&
+			       !S_ISLNK(inode->i_mode))) {
+			if (nomount_inode) {
+				iput(nomount_inode);
+			}
+			return ERR_PTR(-EOPNOTSUPP);
+		}
+
+		inode = ksu_susfs_create_redirect_inode(
+			dir->i_sb, inode, child_path, visible_child_path,
+			(u32)nomount_ino);
+		iput(nomount_inode);
+		if (!inode) {
+			return ERR_PTR(-ENOMEM);
+		}
+
+		return d_splice_alias(inode, dentry);
+	}
+#endif
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	if (ksu_nomount_dir_is_internal(priv->visible_path)) {
+		d_add(dentry, NULL);
+		return NULL;
+	}
+#endif
 
 	err = ksu_susfs_build_child_path(priv->backend_path, &dentry->d_name,
 					 child_path, sizeof(child_path));
@@ -645,12 +1051,14 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 	}
 
 	inode = d_backing_inode(backend_path.dentry);
-	if (!inode || (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))) {
+	if (!inode || (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode) &&
+		       !S_ISLNK(inode->i_mode))) {
 		path_put(&backend_path);
 		return ERR_PTR(-EOPNOTSUPP);
 	}
 
 	inode = ksu_susfs_create_redirect_inode(dir->i_sb, inode, child_path,
+						visible_child_path,
 						ksu_susfs_hash_path(child_path));
 	path_put(&backend_path);
 	if (!inode) {
@@ -663,6 +1071,13 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 static const struct inode_operations ksu_susfs_file_iops = {
 	.getattr = ksu_susfs_file_getattr,
 	.setattr = ksu_susfs_file_setattr,
+	.listxattr = ksu_susfs_file_listxattr,
+};
+
+static const struct inode_operations ksu_susfs_symlink_iops = {
+	.getattr = ksu_susfs_file_getattr,
+	.setattr = ksu_susfs_file_setattr,
+	.get_link = ksu_susfs_symlink_get_link,
 	.listxattr = ksu_susfs_file_listxattr,
 };
 
@@ -689,6 +1104,7 @@ static const struct inode_operations ksu_susfs_dir_iops = {
 static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 						     struct inode *backend_inode,
 						     const char *backend_path,
+						     const char *visible_path,
 						     u32 ino_seed)
 {
 	struct inode *inode;
@@ -708,7 +1124,9 @@ static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 	priv->backend_inode = igrab(backend_inode);
 	if (!priv->backend_inode ||
 	    strscpy(priv->backend_path, backend_path,
-		    sizeof(priv->backend_path)) < 0) {
+		    sizeof(priv->backend_path)) < 0 ||
+	    strscpy(priv->visible_path, visible_path ? visible_path : backend_path,
+		    sizeof(priv->visible_path)) < 0) {
 		if (priv->backend_inode) {
 			iput(priv->backend_inode);
 		}
@@ -728,6 +1146,10 @@ static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 	if (S_ISDIR(backend_inode->i_mode)) {
 		inode->i_op = &ksu_susfs_dir_iops;
 		inode->i_fop = &ksu_susfs_dir_fops;
+	} else if (S_ISLNK(backend_inode->i_mode) ||
+		   (backend_inode->i_op && backend_inode->i_op->get_link)) {
+		inode->i_op = &ksu_susfs_symlink_iops;
+		inode->i_fop = &ksu_susfs_file_fops;
 	} else {
 		inode->i_op = &ksu_susfs_file_iops;
 		inode->i_fop = &ksu_susfs_file_fops;
@@ -755,7 +1177,8 @@ static int ksu_susfs_xattr_get(const struct xattr_handler *handler,
 		container_of(handler, struct ksu_susfs_xattr_proxy, fake);
 
 	if (inode->i_op == &ksu_susfs_file_iops ||
-	    inode->i_op == &ksu_susfs_dir_iops) {
+	    inode->i_op == &ksu_susfs_dir_iops ||
+	    inode->i_op == &ksu_susfs_symlink_iops) {
 		struct inode *backend_inode = ksu_susfs_backend_inode(inode);
 
 		if (!backend_inode) {
@@ -781,7 +1204,8 @@ static int ksu_susfs_xattr_set(const struct xattr_handler *handler,
 		container_of(handler, struct ksu_susfs_xattr_proxy, fake);
 
 	if (inode->i_op == &ksu_susfs_file_iops ||
-	    inode->i_op == &ksu_susfs_dir_iops) {
+	    inode->i_op == &ksu_susfs_dir_iops ||
+	    inode->i_op == &ksu_susfs_symlink_iops) {
 		struct inode *backend_inode = ksu_susfs_backend_inode(inode);
 
 		if (!backend_inode) {
@@ -800,12 +1224,19 @@ static int ksu_susfs_xattr_set(const struct xattr_handler *handler,
 
 static KSU_SUSFS_ACTOR_RET
 ksu_susfs_actor_proxy(struct dir_context *ctx, const char *name, int namelen,
-		      loff_t offset, u64 ino, unsigned int d_type)
+			      loff_t offset, u64 ino, unsigned int d_type)
 {
 	struct ksu_susfs_proxy_ctx *proxy =
 		container_of(ctx, struct ksu_susfs_proxy_ctx, ctx);
 	struct ksu_susfs_rule *rule;
 	KSU_SUSFS_ACTOR_RET ret;
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	if (proxy->nomount_active &&
+	    ksu_nomount_filter_child(proxy->parent->path, name, namelen)) {
+		return KSU_SUSFS_ACTOR_CONTINUE;
+	}
+#endif
 
 	rcu_read_lock();
 	rule = ksu_susfs_lookup_rule_rcu(proxy->parent, name, namelen);
@@ -824,41 +1255,59 @@ ksu_susfs_actor_proxy(struct dir_context *ctx, const char *name, int namelen,
 }
 
 static int ksu_susfs_hijacked_iterate_shared(struct file *file,
-					     struct dir_context *ctx)
+						     struct dir_context *ctx)
 {
 	struct ksu_susfs_fop *wrapped =
 		__ksu_susfs_get(smp_load_acquire(&file->f_op),
 				struct ksu_susfs_fop, fake_fop);
 	struct ksu_susfs_proxy_ctx proxy_ctx;
+	bool susfs_active;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	bool nomount_active;
+#endif
+	int ret;
 
 	if (!wrapped || !wrapped->orig_fop) {
 		return -ENOTDIR;
 	}
 
-	if (!ksu_susfs_should_hide_current()) {
-		goto do_real_iterate;
-	}
-
-	rcu_read_lock();
-	if (!ksu_susfs_parent_has_hide_rules_rcu(wrapped->parent)) {
+	susfs_active = false;
+	if (ksu_susfs_should_hide_current()) {
+		rcu_read_lock();
+		susfs_active =
+			ksu_susfs_parent_has_hide_rules_rcu(wrapped->parent);
 		rcu_read_unlock();
+	}
+	#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+		nomount_active = ksu_nomount_parent_active(wrapped->parent->path);
+		if (nomount_active && ksu_nomount_pos_is_magic(ctx->pos)) {
+			ksu_nomount_emit_children(wrapped->parent->path, ctx);
+			return 0;
+		}
+		if (!susfs_active && !nomount_active) {
+	#else
+		if (!susfs_active) {
+#endif
 		goto do_real_iterate;
 	}
-	rcu_read_unlock();
 
 	memset(&proxy_ctx, 0, sizeof(proxy_ctx));
 	proxy_ctx.ctx.actor = ksu_susfs_actor_proxy;
 	proxy_ctx.ctx.pos = ctx->pos;
 	proxy_ctx.orig_ctx = ctx;
 	proxy_ctx.parent = wrapped->parent;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	proxy_ctx.nomount_active = nomount_active;
+#endif
 
-	{
-		int ret = ksu_susfs_call_iterate(wrapped->orig_fop, file,
-						 &proxy_ctx.ctx);
-
-		ctx->pos = proxy_ctx.ctx.pos;
-		return ret;
+	ret = ksu_susfs_call_iterate(wrapped->orig_fop, file, &proxy_ctx.ctx);
+	ctx->pos = proxy_ctx.ctx.pos;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	if (ret >= 0 && nomount_active) {
+		ksu_nomount_emit_children(wrapped->parent->path, ctx);
 	}
+#endif
+	return ret;
 
 do_real_iterate:
 	return ksu_susfs_call_iterate(wrapped->orig_fop, file, ctx);
@@ -883,13 +1332,71 @@ static struct dentry *ksu_susfs_hijacked_lookup(struct inode *dir,
 	struct path backend_resolved;
 	struct inode *inode;
 	char visible_path[KSU_SUSFS_MAX_PATHNAME];
+	char nomount_visible_path[KSU_SUSFS_MAX_PATHNAME];
 	char backend_path[KSU_SUSFS_MAX_PATHNAME];
 	u32 path_hash;
 	int err;
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	unsigned int nomount_type;
+	unsigned long nomount_ino;
+	struct inode *nomount_inode = NULL;
+	int nomount_match;
+#endif
 
 	if (!wrapped || !wrapped->orig_iop) {
 		return ERR_PTR(-EOPNOTSUPP);
 	}
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	nomount_match = ksu_nomount_lookup_child(
+		wrapped->parent->path, dentry->d_name.name, dentry->d_name.len,
+		backend_path, sizeof(backend_path), &nomount_inode, &nomount_ino,
+		&nomount_type);
+	if (nomount_match == KSU_NOMOUNT_LOOKUP_WHITEOUT) {
+		d_add(dentry, NULL);
+		return NULL;
+	}
+	if (nomount_match == KSU_NOMOUNT_LOOKUP_REDIRECT) {
+		if (nomount_type != DT_REG && nomount_type != DT_DIR &&
+		    nomount_type != DT_LNK) {
+			if (nomount_inode) {
+				iput(nomount_inode);
+			}
+			goto fallback;
+		}
+
+		err = ksu_susfs_build_child_path(wrapped->parent->path,
+						 &dentry->d_name,
+						 nomount_visible_path,
+						 sizeof(nomount_visible_path));
+		if (err) {
+			if (nomount_inode) {
+				iput(nomount_inode);
+			}
+			goto fallback;
+		}
+
+		inode = nomount_inode;
+		if (!inode || (!S_ISREG(inode->i_mode) &&
+			       !S_ISDIR(inode->i_mode) &&
+			       !S_ISLNK(inode->i_mode))) {
+			if (nomount_inode) {
+				iput(nomount_inode);
+			}
+			goto fallback;
+		}
+
+		inode = ksu_susfs_create_redirect_inode(
+			dir->i_sb, inode, backend_path, nomount_visible_path,
+			(u32)nomount_ino);
+		iput(nomount_inode);
+		if (!inode) {
+			goto fallback;
+		}
+
+		return d_splice_alias(inode, dentry);
+	}
+#endif
 
 	if (ksu_susfs_should_skip()) {
 		goto fallback;
@@ -938,14 +1445,15 @@ static struct dentry *ksu_susfs_hijacked_lookup(struct inode *dir,
 	}
 
 	inode = d_backing_inode(backend_resolved.dentry);
-	if (!inode || (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))) {
+	if (!inode || (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode) &&
+		       !S_ISLNK(inode->i_mode))) {
 		path_put(&backend_resolved);
 		path_put(&visible_resolved);
 		goto fallback;
 	}
 
 	inode = ksu_susfs_create_redirect_inode(dir->i_sb, inode, backend_path,
-						path_hash);
+						visible_path, path_hash);
 	path_put(&backend_resolved);
 	path_put(&visible_resolved);
 	if (!inode) {
@@ -970,7 +1478,8 @@ static void ksu_susfs_hijacked_destroy_inode(struct inode *inode)
 	struct ksu_susfs_sop *wrapped_sop;
 
 	if (inode->i_op == &ksu_susfs_file_iops ||
-	    inode->i_op == &ksu_susfs_dir_iops) {
+	    inode->i_op == &ksu_susfs_dir_iops ||
+	    inode->i_op == &ksu_susfs_symlink_iops) {
 		priv = ksu_susfs_backend_priv(inode);
 		if (priv) {
 			if (priv->backend_inode) {
@@ -1336,6 +1845,66 @@ static int ksu_susfs_attach_parent_locked(struct ksu_susfs_parent *parent)
 	path_put(&resolved);
 	return 0;
 }
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+int ksu_susfs_attach_nomount_parent(const char *path)
+{
+	struct ksu_susfs_parent *parent;
+	char *normalized;
+	size_t len;
+	bool new_parent = false;
+	int err;
+
+	if (!path || path[0] != '/') {
+		return -EINVAL;
+	}
+
+	normalized = kstrdup(path, GFP_KERNEL);
+	if (!normalized) {
+		return -ENOMEM;
+	}
+
+	len = strlen(normalized);
+	while (len > 1 && normalized[len - 1] == '/') {
+		normalized[--len] = '\0';
+	}
+
+	mutex_lock(&ksu_susfs_lock);
+	parent = ksu_susfs_find_parent_locked(normalized);
+	if (!parent) {
+		parent = kzalloc(sizeof(*parent), GFP_KERNEL);
+		if (!parent) {
+			err = -ENOMEM;
+			goto out_unlock;
+		}
+
+		INIT_LIST_HEAD(&parent->all_list);
+		INIT_LIST_HEAD(&parent->rules);
+		if (strscpy(parent->path, normalized, sizeof(parent->path)) < 0) {
+			kfree(parent);
+			err = -ENAMETOOLONG;
+			goto out_unlock;
+		}
+
+		hash_add(ksu_susfs_parents_ht, &parent->node,
+			 ksu_susfs_hash_path(parent->path));
+		list_add_tail(&parent->all_list, &ksu_susfs_parent_list);
+		new_parent = true;
+	}
+
+	err = ksu_susfs_attach_parent_locked(parent);
+	if (err && new_parent) {
+		hash_del(&parent->node);
+		list_del(&parent->all_list);
+		kfree(parent);
+	}
+
+out_unlock:
+	mutex_unlock(&ksu_susfs_lock);
+	kfree(normalized);
+	return err;
+}
+#endif
 
 static int ksu_susfs_validate_redirect(const char *visible_path,
 				       const char *backend_path)

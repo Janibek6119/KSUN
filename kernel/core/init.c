@@ -32,6 +32,9 @@
 #ifdef CONFIG_KSU_KPROBES_SUSFS
 #include "susfs/susfs.h"
 #endif
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+#include "nomount/nomount.h"
+#endif
 
 #if defined(__x86_64__)
 #include <asm/cpufeature.h>
@@ -156,6 +159,9 @@ int __init kernelsu_init(void)
 #ifdef CONFIG_KSU_KPROBES_SUSFS
 	ksu_susfs_init();
 #endif
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	ksu_nomount_init();
+#endif
 
 	ksu_supercalls_init();
 
@@ -221,6 +227,9 @@ void __exit kernelsu_exit(void)
 
 	ksu_supercalls_exit();
 
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	ksu_nomount_exit();
+#endif
 #ifdef CONFIG_KSU_KPROBES_SUSFS
 	ksu_susfs_exit();
 #endif

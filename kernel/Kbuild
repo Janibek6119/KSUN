@@ -255,6 +255,36 @@ ccflags-y += -DKSU_SUSFS_HAS_ITERATE
 endif
 endif
 
+ifeq ($(CONFIG_KSU_KPROBES_NOMOUNT),y)
+kernelsu-objs += nomount/core.o
+kernelsu-objs += nomount/netlink.o
+
+ifeq ($(shell sed -n '/struct genl_family/,/^};/p' \
+	$(srctree)/include/net/genetlink.h 2>/dev/null | \
+	grep -Eq 'nla_policy[[:space:]]+[*][[:space:]]*policy'; echo $$?),0)
+ccflags-y += -DKSU_NOMOUNT_GENL_FAMILY_HAS_POLICY
+endif
+ifeq ($(shell sed -n '/struct genl_family/,/^};/p' \
+	$(srctree)/include/net/genetlink.h 2>/dev/null | \
+	grep -Eq 'netnsok[[:space:]]*;'; echo $$?),0)
+ccflags-y += -DKSU_NOMOUNT_GENL_FAMILY_HAS_NETNSOK
+endif
+ifeq ($(shell sed -n '/struct genl_family/,/^};/p' \
+	$(srctree)/include/net/genetlink.h 2>/dev/null | \
+	grep -Eq 'module[[:space:]]*;'; echo $$?),0)
+ccflags-y += -DKSU_NOMOUNT_GENL_FAMILY_HAS_MODULE
+endif
+ifeq ($(shell sed -n '/struct genl_family/,/^};/p' \
+	$(srctree)/include/net/genetlink.h 2>/dev/null | \
+	grep -Eq 'genl_ops[[:space:]]+[*][[:space:]]*ops'; echo $$?),0)
+ccflags-y += -DKSU_NOMOUNT_GENL_FAMILY_HAS_OPS
+endif
+ifeq ($(shell grep -Eq 'genl_register_family_with_ops' \
+	$(srctree)/include/net/genetlink.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_NOMOUNT_HAS_GENL_REGISTER_FAMILY_WITH_OPS
+endif
+endif
+
 ifdef KBUILD_EXTMOD
 ifeq ($(CONFIG_KSU_DISABLE_MANAGER),y)
 ccflags-y += -DCONFIG_KSU_DISABLE_MANAGER=1
