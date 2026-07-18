@@ -3,8 +3,10 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/interrupt.h>
 #include <linux/kprobes.h>
 #include <linux/pid.h>
+#include <linux/preempt.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/task_work.h>
@@ -39,6 +41,12 @@ struct ksu_susfs_tw {
     unsigned int cmd;
     void __user *arg;
 };
+
+static bool ksu_susfs_may_sleep_now(void)
+{
+    return !in_interrupt() && !in_atomic() && !irqs_disabled() &&
+           !oops_in_progress;
+}
 #endif
 #endif
 
@@ -108,8 +116,45 @@ static void ksu_susfs_tw_func(struct callback_head *cb)
      * user buffers, so they must not run from the reboot kprobe's
      * atomic pre-handler context.
      */
-    ksu_susfs_handle_compat(tw->cmd, tw->arg);
+    if (ksu_susfs_may_sleep_now())
+        ksu_susfs_handle_compat(tw->cmd, tw->arg);
+    else
+        pr_warn_ratelimited("susfs task_work ran in atomic context\n");
     kfree(tw);
+}
+
+static bool ksu_susfs_defer_compat(unsigned int cmd, void __user *arg)
+{
+    struct ksu_susfs_tw *tw;
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw)
+        return false;
+
+    tw->cmd = cmd;
+    tw->arg = arg;
+    tw->cb.func = ksu_susfs_tw_func;
+
+    if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+        kfree(tw);
+        pr_warn("susfs add task_work failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+static void ksu_susfs_handle_compat_safely(unsigned int cmd, void __user *arg,
+                                           bool force_defer)
+{
+    if (force_defer || !ksu_susfs_may_sleep_now()) {
+        if (!ksu_susfs_defer_compat(cmd, arg) && !force_defer &&
+            ksu_susfs_may_sleep_now())
+            ksu_susfs_handle_compat(cmd, arg);
+        return;
+    }
+
+    ksu_susfs_handle_compat(cmd, arg);
 }
 #endif
 #endif
@@ -142,7 +187,11 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
 
 #ifdef CONFIG_KSU_KPROBES_SUSFS
 	if (magic2 == KSU_SUSFS_MAGIC) {
+#ifdef CONFIG_KSU_KPROBES_HOOK
+		ksu_susfs_handle_compat_safely(cmd, *arg, false);
+#else
 		ksu_susfs_handle_compat(cmd, *arg);
+#endif
 		return 0;
 	}
 #endif
@@ -308,21 +357,7 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 
 #ifdef CONFIG_KSU_KPROBES_SUSFS
     if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_SUSFS_MAGIC) {
-        struct ksu_susfs_tw *tw;
-
-        tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
-        if (!tw)
-            return 0;
-
-        tw->cmd = cmd;
-        tw->arg = (void __user *)arg4;
-        tw->cb.func = ksu_susfs_tw_func;
-
-        if (task_work_add(current, &tw->cb, TWA_RESUME)) {
-            kfree(tw);
-            pr_warn("susfs add task_work failed\n");
-        }
-
+        ksu_susfs_handle_compat_safely(cmd, (void __user *)arg4, true);
         return 0;
     }
 #endif
