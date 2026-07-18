@@ -53,6 +53,8 @@ struct ksu_nomount_dump_state {
 	int index;
 };
 
+struct kstat;
+
 void ksu_nomount_init(void);
 void ksu_nomount_exit(void);
 
@@ -75,7 +77,9 @@ void ksu_nomount_emit_children(const char *parent_path, struct dir_context *ctx)
 int ksu_nomount_lookup_child(const char *parent_path, const char *name,
 			     size_t namelen, char *real_path,
 			     size_t real_size, struct inode **backend_inode,
-			     unsigned long *ino, unsigned int *d_type);
+			     unsigned long *ino, unsigned int *d_type,
+			     struct kstat *visible_stat,
+			     bool *has_visible_stat);
 
 int ksu_nomount_netlink_init(void);
 void ksu_nomount_netlink_exit(void);

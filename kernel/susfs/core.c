@@ -51,6 +51,8 @@ enum ksu_susfs_rule_type {
 
 struct ksu_susfs_redirect_priv {
 	struct inode *backend_inode;
+	bool has_visible_stat;
+	struct kstat visible_stat;
 	char backend_path[KSU_SUSFS_MAX_PATHNAME];
 	char visible_path[KSU_SUSFS_MAX_PATHNAME];
 };
@@ -814,11 +816,19 @@ static const struct file_operations ksu_susfs_file_fops = {
 
 static int ksu_susfs_file_getattr(KSU_SUSFS_GETATTR_ARGS)
 {
+	struct ksu_susfs_redirect_priv *priv;
 	struct inode *v_inode;
 	struct inode *backend_inode;
 
 	KSU_SUSFS_GETATTR_PREP();
 	v_inode = d_backing_inode(KSU_SUSFS_GETATTR_DENTRY);
+	priv = ksu_susfs_backend_priv(v_inode);
+	if (priv && priv->has_visible_stat) {
+		*stat = priv->visible_stat;
+		stat->dev = KSU_SUSFS_GETATTR_DENTRY->d_sb->s_dev;
+		return 0;
+	}
+
 	backend_inode = ksu_susfs_backend_inode(v_inode);
 
 	if (!backend_inode) {
@@ -959,6 +969,8 @@ static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 						     struct inode *backend_inode,
 						     const char *backend_path,
 						     const char *visible_path,
+						     const struct kstat *visible_stat,
+						     bool has_visible_stat,
 						     u32 ino_seed);
 
 static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *dentry,
@@ -973,7 +985,9 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 	unsigned int nomount_type;
 	unsigned long nomount_ino;
+	struct kstat nomount_visible_stat;
 	struct inode *nomount_inode = NULL;
+	bool nomount_has_visible_stat = false;
 	int nomount_match;
 #endif
 
@@ -992,7 +1006,8 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 	nomount_match = ksu_nomount_lookup_child(
 		priv->visible_path, dentry->d_name.name, dentry->d_name.len,
 		child_path, sizeof(child_path), &nomount_inode, &nomount_ino,
-		&nomount_type);
+		&nomount_type, &nomount_visible_stat,
+		&nomount_has_visible_stat);
 	if (nomount_match == KSU_NOMOUNT_LOOKUP_WHITEOUT) {
 		d_add(dentry, NULL);
 		return NULL;
@@ -1018,6 +1033,7 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 
 		inode = ksu_susfs_create_redirect_inode(
 			dir->i_sb, inode, child_path, visible_child_path,
+			&nomount_visible_stat, nomount_has_visible_stat,
 			(u32)nomount_ino);
 		iput(nomount_inode);
 		if (!inode) {
@@ -1059,6 +1075,7 @@ static struct dentry *ksu_susfs_dir_lookup(struct inode *dir, struct dentry *den
 
 	inode = ksu_susfs_create_redirect_inode(dir->i_sb, inode, child_path,
 						visible_child_path,
+						NULL, false,
 						ksu_susfs_hash_path(child_path));
 	path_put(&backend_path);
 	if (!inode) {
@@ -1105,6 +1122,8 @@ static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 						     struct inode *backend_inode,
 						     const char *backend_path,
 						     const char *visible_path,
+						     const struct kstat *visible_stat,
+						     bool has_visible_stat,
 						     u32 ino_seed)
 {
 	struct inode *inode;
@@ -1134,8 +1153,13 @@ static struct inode *ksu_susfs_create_redirect_inode(struct super_block *sb,
 		iput(inode);
 		return NULL;
 	}
+	if (has_visible_stat && visible_stat) {
+		priv->has_visible_stat = true;
+		priv->visible_stat = *visible_stat;
+	}
 
-	inode->i_ino = (unsigned long)ino_seed;
+	inode->i_ino = priv->has_visible_stat && priv->visible_stat.ino ?
+		       priv->visible_stat.ino : (unsigned long)ino_seed;
 	inode->i_mode = backend_inode->i_mode;
 	inode->i_size = i_size_read(backend_inode);
 	inode->i_blocks = backend_inode->i_blocks;
@@ -1339,7 +1363,9 @@ static struct dentry *ksu_susfs_hijacked_lookup(struct inode *dir,
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 	unsigned int nomount_type;
 	unsigned long nomount_ino;
+	struct kstat nomount_visible_stat;
 	struct inode *nomount_inode = NULL;
+	bool nomount_has_visible_stat = false;
 	int nomount_match;
 #endif
 
@@ -1351,7 +1377,8 @@ static struct dentry *ksu_susfs_hijacked_lookup(struct inode *dir,
 	nomount_match = ksu_nomount_lookup_child(
 		wrapped->parent->path, dentry->d_name.name, dentry->d_name.len,
 		backend_path, sizeof(backend_path), &nomount_inode, &nomount_ino,
-		&nomount_type);
+		&nomount_type, &nomount_visible_stat,
+		&nomount_has_visible_stat);
 	if (nomount_match == KSU_NOMOUNT_LOOKUP_WHITEOUT) {
 		d_add(dentry, NULL);
 		return NULL;
@@ -1388,6 +1415,7 @@ static struct dentry *ksu_susfs_hijacked_lookup(struct inode *dir,
 
 		inode = ksu_susfs_create_redirect_inode(
 			dir->i_sb, inode, backend_path, nomount_visible_path,
+			&nomount_visible_stat, nomount_has_visible_stat,
 			(u32)nomount_ino);
 		iput(nomount_inode);
 		if (!inode) {
@@ -1453,7 +1481,8 @@ static struct dentry *ksu_susfs_hijacked_lookup(struct inode *dir,
 	}
 
 	inode = ksu_susfs_create_redirect_inode(dir->i_sb, inode, backend_path,
-						visible_path, path_hash);
+						visible_path, NULL, false,
+						path_hash);
 	path_put(&backend_resolved);
 	path_put(&visible_resolved);
 	if (!inode) {

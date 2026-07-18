@@ -16,6 +16,7 @@
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/stat.h>
 #include <linux/string.h>
 
 #include "klog.h" // IWYU pragma: keep
@@ -58,6 +59,8 @@ struct ksu_nomount_rule {
 	u32 flags;
 	unsigned long ino;
 	unsigned int d_type;
+	bool has_visible_stat;
+	struct kstat visible_stat;
 	char virtual_path[KSU_SUSFS_MAX_PATHNAME];
 	char real_path[KSU_SUSFS_MAX_PATHNAME];
 	char parent_path[KSU_SUSFS_MAX_PATHNAME];
@@ -327,6 +330,33 @@ static int ksu_nomount_real_dir_status(const char *path)
 
 	path_put(&resolved);
 	return 0;
+}
+
+static int ksu_nomount_get_visible_stat(const char *path, struct kstat *stat)
+{
+	struct path resolved;
+	struct inode *inode;
+	int err;
+
+	err = ksu_nomount_resolve_path_flags(path, LOOKUP_FOLLOW, &resolved);
+	if (err)
+		return err;
+
+#ifdef STATX_BASIC_STATS
+	err = vfs_getattr(&resolved, stat,
+			  STATX_BASIC_STATS | STATX_BTIME,
+			  AT_STATX_SYNC_AS_STAT);
+#else
+	err = vfs_getattr(&resolved, stat);
+#endif
+	if (!err && !stat->ino) {
+		inode = d_backing_inode(resolved.dentry);
+		if (inode)
+			stat->ino = inode->i_ino;
+	}
+
+	path_put(&resolved);
+	return err;
 }
 
 static void ksu_nomount_drop_cached_child(const char *path)
@@ -720,7 +750,9 @@ static void ksu_nomount_uid_free(struct ksu_nomount_uid *entry)
 static struct ksu_nomount_rule *
 ksu_nomount_alloc_rule(const char *virtual_path, const char *real_path,
 		       u32 flags, unsigned int d_type,
-		       struct inode *backend_inode)
+		       struct inode *backend_inode,
+		       const struct kstat *visible_stat,
+		       bool has_visible_stat)
 {
 	struct ksu_nomount_rule *rule;
 	int err;
@@ -752,7 +784,13 @@ ksu_nomount_alloc_rule(const char *virtual_path, const char *real_path,
 			return ERR_PTR(-ENOENT);
 		}
 	}
-	rule->ino = rule->hash;
+	if (has_visible_stat && visible_stat) {
+		rule->has_visible_stat = true;
+		rule->visible_stat = *visible_stat;
+		rule->ino = visible_stat->ino ?: rule->hash;
+	} else {
+		rule->ino = rule->hash;
+	}
 	rule->d_type = d_type;
 	if (d_type == DT_DIR)
 		rule->flags |= KSU_NOMOUNT_FLAG_IS_DIR;
@@ -1004,7 +1042,7 @@ ksu_nomount_create_missing_ancestors_locked(const char *virtual_path,
 				scratch->prefix, scratch->internal_real,
 				KSU_NOMOUNT_FLAG_INTERNAL |
 					KSU_NOMOUNT_FLAG_IS_DIR,
-				DT_DIR, inode);
+				DT_DIR, inode, NULL, false);
 			path_put(&resolved);
 		}
 		if (IS_ERR(rule)) {
@@ -1070,10 +1108,12 @@ int ksu_nomount_add_rule(const char *virtual_path, const char *real_path,
 	struct ksu_nomount_rule *rule;
 	struct ksu_nomount_rule_scratch *scratch;
 	struct path resolved;
+	struct kstat visible_stat;
 	struct inode *inode;
 	struct inode *backend_inode = NULL;
 	bool whiteout = (flags & KSU_NOMOUNT_FLAG_WHITEOUT) != 0;
 	bool resolved_backend = false;
+	bool has_visible_stat = false;
 	unsigned int d_type = DT_REG;
 	LIST_HEAD(rule_victims);
 	LIST_HEAD(parent_victims);
@@ -1126,9 +1166,14 @@ int ksu_nomount_add_rule(const char *virtual_path, const char *real_path,
 		backend_inode = inode;
 	}
 
+	if (!ksu_nomount_get_visible_stat(scratch->normalized_virtual,
+					  &visible_stat))
+		has_visible_stat = true;
+
 	rule = ksu_nomount_alloc_rule(scratch->normalized_virtual,
 				      scratch->normalized_real, flags, d_type,
-				      backend_inode);
+				      backend_inode, &visible_stat,
+				      has_visible_stat);
 	if (resolved_backend) {
 		path_put(&resolved);
 		resolved_backend = false;
@@ -1494,7 +1539,9 @@ void ksu_nomount_emit_children(const char *parent_path, struct dir_context *ctx)
 int ksu_nomount_lookup_child(const char *parent_path, const char *name,
 			     size_t namelen, char *real_path,
 			     size_t real_size, struct inode **backend_inode,
-			     unsigned long *ino, unsigned int *d_type)
+			     unsigned long *ino, unsigned int *d_type,
+			     struct kstat *visible_stat,
+			     bool *has_visible_stat)
 {
 	struct ksu_nomount_rule *rule;
 	char *virtual_path;
@@ -1537,6 +1584,10 @@ int ksu_nomount_lookup_child(const char *parent_path, const char *name,
 
 	*ino = rule->ino;
 	*d_type = rule->d_type;
+	if (visible_stat)
+		*visible_stat = rule->visible_stat;
+	if (has_visible_stat)
+		*has_visible_stat = rule->has_visible_stat;
 	ret = KSU_NOMOUNT_LOOKUP_REDIRECT;
 
 out:
