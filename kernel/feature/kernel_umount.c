@@ -8,6 +8,7 @@
 #include <linux/nsproxy.h>
 #include <linux/path.h>
 #include <linux/printk.h>
+#include <linux/syscalls.h>
 #include <linux/types.h>
 
 #include "feature/kernel_umount.h"
