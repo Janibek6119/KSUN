@@ -1,5 +1,6 @@
 #include <linux/security.h>
 #include <linux/atomic.h>
+#include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/version.h>
 
@@ -76,13 +77,28 @@ static const struct ksu_feature_handler avc_spoof_handler = {
 
 static int get_sid()
 {
-	// dont load at all if we cant get sids
-	int err = security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &su_sid);
+	/* KernelSU deployments use u:r:ksu:s0; retain the legacy su domain as
+	 * a fallback for policies that still label the daemon that way. */
+	static const char *const source_contexts[] = {
+		"u:r:ksu:s0",
+		"u:r:su:s0",
+	};
+	int err = -ENOENT;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(source_contexts); i++) {
+		err = security_secctx_to_secid(source_contexts[i],
+					       strlen(source_contexts[i]), &su_sid);
+		if (!err) {
+			pr_info("avc_spoof/get_sid: source context %s, sid: %u\n",
+				source_contexts[i], su_sid);
+			break;
+		}
+	}
 	if (err) {
-		pr_info("avc_spoof/get_sid: su_sid not found!\n");
+		pr_info("avc_spoof/get_sid: ksu/su source sid not found\n");
 		return -1;
 	}
-	pr_info("avc_spoof/get_sid: su_sid: %u\n", su_sid);
 
 	err = security_secctx_to_secid("u:r:priv_app:s0:c512,c768", strlen("u:r:priv_app:s0:c512,c768"), &priv_app_sid);
 	if (err) {

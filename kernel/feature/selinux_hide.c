@@ -799,22 +799,19 @@ static int ksu_selinux_hide_enable(void)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
 #elif defined(KSU_COMPAT_USE_SELINUX_STATE)
-    fake_state.initialized = true;
-    fake_state.ss = kzalloc(sizeof(*fake_state.ss), GFP_KERNEL);
-    if (!fake_state.ss) return -ENOMEM;
-    fake_state.ss->sidtab = kzalloc(sizeof(struct sidtab), GFP_KERNEL);
-    if (!fake_state.ss->sidtab) { kfree(fake_state.ss); return -ENOMEM; }
-    
-    fake_state.ss->latest_granting = KSU_SELINUX_POLICYLOAD_SEQNO;
-    rwlock_init(&(fake_state.ss->policy_rwlock));
-    memcpy(&fake_state.ss->policydb, backup_policydb, sizeof(struct policydb));
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-    memcpy(fake_state.ss->sidtab, backup_sidtab, sizeof(struct sidtab));
-#else
-    memcpy(&fake_state.ss->sidtab, backup_sidtab, sizeof(struct sidtab));
-#endif
-    kfree(backup_policydb); kfree(backup_sidtab);
-    backup_policydb = NULL; backup_sidtab = NULL;
+	if (!fake_state.ss) {
+		fake_state.ss = kzalloc(sizeof(*fake_state.ss), GFP_KERNEL);
+		if (!fake_state.ss)
+			return -ENOMEM;
+
+		/* SID hash chains include entries embedded in backup_sidtab. */
+		fake_state.ss->sidtab = backup_sidtab;
+		memcpy(&fake_state.ss->policydb, backup_policydb,
+		       sizeof(struct policydb));
+		fake_state.ss->latest_granting = KSU_SELINUX_POLICYLOAD_SEQNO;
+		rwlock_init(&fake_state.ss->policy_rwlock);
+		fake_state.initialized = true;
+	}
 #endif
 
 #ifdef CONFIG_KALLSYMS_ALL
