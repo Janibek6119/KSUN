@@ -77,6 +77,26 @@ static const struct ksu_feature_handler su_compat_handler = {
 #ifdef CONFIG_KSU_KPROBES_HOOK
 static const char su_path[] = SU_PATH;
 
+/*
+ * The sucompat stat/faccess hooks are on every syscall.  Copy only the
+ * exact-length candidate and reject faults/longer names before doing the
+ * full comparison; this avoids clearing a second buffer on every call while
+ * retaining no-fault behavior for unaligned or invalid user pointers.
+ */
+static __always_inline bool
+ksu_sucompat_user_path_matches(const char __user *filename)
+{
+	char path[sizeof(su_path)];
+	long len;
+
+	if (!filename)
+		return false;
+	len = strncpy_from_user_nofault(path, filename, sizeof(path));
+	if (len != sizeof(su_path) - 1)
+		return false;
+	return !memcmp(path, su_path, sizeof(su_path));
+}
+
 static void __user *userspace_stack_buffer(const void *d, size_t len)
 {
 	// To avoid having to mmap a page in userspace, just write below the stack
@@ -121,11 +141,7 @@ long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
 
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
-	char path[sizeof(su_path) + 1];
-	memset(path, 0, sizeof(path));
-	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
-
-	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
+	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
 		old_cred = override_creds(ksu_cred);
 		if (is_ksud_exists()) {
 			ksu_compat_sulog('a');
@@ -157,11 +173,7 @@ long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
 
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
-	char path[sizeof(su_path) + 1];
-	memset(path, 0, sizeof(path));
-	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
-
-	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
+	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
 		old_cred = override_creds(ksu_cred);
 		if (is_ksud_exists()) {
 			ksu_compat_sulog('s');
@@ -186,7 +198,6 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 {
 	const char __user *new_filename;
 	const struct cred *old_cred;
-	char path[sizeof(su_path) + 1];
 	bool exists;
 
 	if (!ksu_su_compat_enabled)
@@ -196,9 +207,7 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 	if (!filename_user || !*filename_user)
 		return false;
 
-	memset(path, 0, sizeof(path));
-	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
-	if (likely(memcmp(path, su_path, sizeof(su_path))))
+	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
 		return false;
 
 	old_cred = override_creds(ksu_cred);
@@ -270,7 +279,7 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 	const char __user *fn;
 	const char __user *const __user *argv_user = (const char __user *const __user *)PT_REGS_PARM2(regs);
 	struct ksu_sulog_pending_event *pending_sucompat = NULL;
-	char path[sizeof(su_path) + 1];
+	char path[sizeof(su_path)];
 	long ret, orig_regs[5];
 	unsigned long addr;
 	int tmp_fd;
@@ -285,7 +294,6 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 
 	addr = untagged_addr((unsigned long)*filename_user);
 	fn = (const char __user *)addr;
-	memset(path, 0, sizeof(path));
 	ret = strncpy_from_user(path, fn, sizeof(path));
 
 	if (ret < 0) {
@@ -293,7 +301,8 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 		goto do_orig_execve;
 	}
 
-	if (likely(memcmp(path, su_path, sizeof(su_path))))
+	if (ret != sizeof(su_path) - 1 ||
+	    likely(memcmp(path, su_path, sizeof(su_path))))
 		goto do_orig_execve;
 
 	ksu_compat_sulog('x');
