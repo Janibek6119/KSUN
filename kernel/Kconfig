@@ -114,17 +114,22 @@ config KSU_KPROBES_NOMOUNT
 	bool "KernelSU hookless NoMount"
 	depends on KSU_KPROBES_SUSFS
 	depends on NET
+	depends on ARM64
+	depends on KALLSYMS
 	default y
 	help
 	  Enable a KernelSU-hosted NoMount-compatible VFS redirection
-	  bridge. This keeps NoMount out of fs/ and reuses the hookless
-	  SUSFS VFS shadow engine, while preserving the Generic Netlink
-	  family and command ABI used by the existing nm userspace tool.
+	  runtime. This keeps NoMount out of fs/ and redirects pathnames at
+	  the native filename constructors, while preserving the Generic
+	  Netlink family and command ABI used by the existing nm userspace
+	  tool.
 
 	  This implementation supports exact child injection, replacement,
 	  whiteout, synthetic intermediate virtual directories, UID
 	  blocking, rule listing, and clear commands. It intentionally
-	  avoids NoMount's separate inode/superblock wrapper stack so SUSFS
-	  and NoMount do not compete over the same VFS operation tables.
+	  avoids fabricated inodes and superblock/VFS-operation wrappers.
+	  It requires ARM64 kprobe entry redirection and kretprobes on the
+	  target kernel; Android ARM64 4.19 and 5.4 configurations with those
+	  facilities are the supported targets.
 
 endmenu

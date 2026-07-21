@@ -5,14 +5,14 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/version.h>
-#include <net/genetlink.h>
-#include <net/netlink.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/unaligned.h>
 #else
 #include <asm/unaligned.h>
 #endif
+#include <net/genetlink.h>
+#include <net/netlink.h>
 
 #include "klog.h" // IWYU pragma: keep
 #include "nomount/nomount.h"
@@ -21,6 +21,12 @@
 #define KSU_NOMOUNT_FAMILY_POLICY .policy = ksu_nomount_genl_policy,
 #else
 #define KSU_NOMOUNT_FAMILY_POLICY
+#endif
+
+#ifdef KSU_NOMOUNT_GENL_OPS_HAS_POLICY
+#define KSU_NOMOUNT_OPS_POLICY .policy = ksu_nomount_genl_policy,
+#else
+#define KSU_NOMOUNT_OPS_POLICY
 #endif
 
 #ifdef KSU_NOMOUNT_GENL_FAMILY_HAS_NETNSOK
@@ -47,18 +53,76 @@ static struct genl_family ksu_nomount_genl_family;
 static bool ksu_nomount_genl_registered;
 
 struct ksu_nomount_dump_scratch {
-	char virtual_path[KSU_SUSFS_MAX_PATHNAME];
-	char real_path[KSU_SUSFS_MAX_PATHNAME];
+	char virtual_path[KSU_NOMOUNT_MAX_PATH];
+	char real_path[KSU_NOMOUNT_MAX_PATH];
 };
 
 static int ksu_nomount_copy_payload_path(const char *data, int len,
 					 char **out)
 {
-	if (len <= 0 || len >= KSU_SUSFS_MAX_PATHNAME)
+	if (len <= 0)
+		return -EINVAL;
+	if (len >= KSU_NOMOUNT_MAX_PATH)
 		return -ENAMETOOLONG;
+	if (memchr(data, '\0', len))
+		return -EINVAL;
 
 	*out = kstrndup(data, len, GFP_KERNEL);
 	return *out ? 0 : -ENOMEM;
+}
+
+static int ksu_nomount_validate_add_payload(const char *data, int len)
+{
+	int pos = 0;
+
+	if (len <= 0)
+		return -EINVAL;
+	while (pos < len) {
+		u32 flags;
+		u16 virtual_len, real_len;
+
+		if (len - pos < 8)
+			return -EINVAL;
+		flags = get_unaligned((const u32 *)(data + pos));
+		virtual_len = get_unaligned((const u16 *)(data + pos + 4));
+		real_len = get_unaligned((const u16 *)(data + pos + 6));
+		pos += 8;
+
+		if (!virtual_len || virtual_len >= KSU_NOMOUNT_MAX_PATH ||
+		    real_len >= KSU_NOMOUNT_MAX_PATH ||
+		    (!(flags & KSU_NOMOUNT_FLAG_WHITEOUT) && !real_len) ||
+		    virtual_len > len - pos ||
+		    real_len > len - pos - virtual_len)
+			return -EINVAL;
+		if (memchr(data + pos, '\0', virtual_len) ||
+		    (real_len &&
+		     memchr(data + pos + virtual_len, '\0', real_len)))
+			return -EINVAL;
+		pos += virtual_len + real_len;
+	}
+	return 0;
+}
+
+static int ksu_nomount_validate_del_payload(const char *data, int len)
+{
+	int pos = 0;
+
+	if (len <= 0)
+		return -EINVAL;
+	while (pos < len) {
+		u16 virtual_len;
+
+		if (len - pos < 2)
+			return -EINVAL;
+		virtual_len = get_unaligned((const u16 *)(data + pos));
+		pos += 2;
+		if (!virtual_len || virtual_len >= KSU_NOMOUNT_MAX_PATH ||
+		    virtual_len > len - pos ||
+		    memchr(data + pos, '\0', virtual_len))
+			return -EINVAL;
+		pos += virtual_len;
+	}
+	return 0;
 }
 
 static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
@@ -72,6 +136,11 @@ static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
 		const char *data = nla_data(payload);
 		int len = nla_len(payload);
 		int pos = 0;
+		int validate_err;
+
+		validate_err = ksu_nomount_validate_add_payload(data, len);
+		if (validate_err)
+			return validate_err;
 
 		while (pos + 8 <= len) {
 			char *virtual_path = NULL;
@@ -86,7 +155,7 @@ static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
 			real_len = get_unaligned((const u16 *)(data + pos + 6));
 			pos += 8;
 
-			if (pos + virtual_len + real_len > len)
+			if (virtual_len == 0 || pos + virtual_len + real_len > len)
 				return first_err ?: -EINVAL;
 
 			err = ksu_nomount_copy_payload_path(data + pos, virtual_len,
@@ -111,7 +180,10 @@ static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
 			kfree(real_path);
 		}
 
-		return success ? 0 : first_err;
+		if (pos != len)
+			return first_err ?: -EINVAL;
+
+		return success ? 0 : (first_err ?: -EINVAL);
 	}
 
 	if (info->attrs[KSU_NOMOUNT_ATTR_VIRTUAL_PATH]) {
@@ -145,6 +217,11 @@ static int ksu_nomount_genl_del_rule(struct sk_buff *skb,
 		const char *data = nla_data(payload);
 		int len = nla_len(payload);
 		int pos = 0;
+		int validate_err;
+
+		validate_err = ksu_nomount_validate_del_payload(data, len);
+		if (validate_err)
+			return validate_err;
 
 		while (pos + 2 <= len) {
 			char *virtual_path = NULL;
@@ -167,8 +244,10 @@ static int ksu_nomount_genl_del_rule(struct sk_buff *skb,
 				first_err = err;
 			kfree(virtual_path);
 		}
+		if (pos != len)
+			return first_err ?: -EINVAL;
 
-		return success ? 0 : first_err;
+		return success ? 0 : (first_err ?: -EINVAL);
 	}
 
 	if (info->attrs[KSU_NOMOUNT_ATTR_VIRTUAL_PATH])
@@ -236,7 +315,8 @@ static int ksu_nomount_genl_dump_rules(struct sk_buff *skb,
 				       struct netlink_callback *cb)
 {
 	struct ksu_nomount_dump_state state = {
-		.index = cb->args[0],
+		.bucket = cb->args[0],
+		.index = cb->args[1],
 	};
 	struct ksu_nomount_dump_scratch *scratch;
 	u32 flags;
@@ -280,7 +360,8 @@ static int ksu_nomount_genl_dump_rules(struct sk_buff *skb,
 
 		genlmsg_end(skb, hdr);
 		state = next;
-		cb->args[0] = state.index;
+		cb->args[0] = state.bucket;
+		cb->args[1] = state.index;
 	}
 
 	ret = skb->len;
@@ -292,11 +373,11 @@ static const struct nla_policy
 	ksu_nomount_genl_policy[KSU_NOMOUNT_ATTR_MAX + 1] = {
 		[KSU_NOMOUNT_ATTR_VIRTUAL_PATH] = {
 			.type = NLA_NUL_STRING,
-			.len = KSU_SUSFS_MAX_PATHNAME,
+			.len = KSU_NOMOUNT_MAX_PATH,
 		},
 		[KSU_NOMOUNT_ATTR_REAL_PATH] = {
 			.type = NLA_NUL_STRING,
-			.len = KSU_SUSFS_MAX_PATHNAME,
+			.len = KSU_NOMOUNT_MAX_PATH,
 		},
 		[KSU_NOMOUNT_ATTR_FLAGS] = { .type = NLA_U32 },
 		[KSU_NOMOUNT_ATTR_UID] = { .type = NLA_U32 },
@@ -309,36 +390,43 @@ static const struct genl_ops ksu_nomount_genl_ops[] = {
 		.cmd = KSU_NOMOUNT_CMD_ADD_RULE,
 		.flags = GENL_ADMIN_PERM,
 		.doit = ksu_nomount_genl_add_rule,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 	{
 		.cmd = KSU_NOMOUNT_CMD_DEL_RULE,
 		.flags = GENL_ADMIN_PERM,
 		.doit = ksu_nomount_genl_del_rule,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 	{
 		.cmd = KSU_NOMOUNT_CMD_CLEAR_ALL,
 		.flags = GENL_ADMIN_PERM,
 		.doit = ksu_nomount_genl_clear_rules,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 	{
 		.cmd = KSU_NOMOUNT_CMD_ADD_UID,
 		.flags = GENL_ADMIN_PERM,
 		.doit = ksu_nomount_genl_add_uid,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 	{
 		.cmd = KSU_NOMOUNT_CMD_DEL_UID,
 		.flags = GENL_ADMIN_PERM,
 		.doit = ksu_nomount_genl_del_uid,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 	{
 		.cmd = KSU_NOMOUNT_CMD_GET_LIST,
 		.flags = GENL_ADMIN_PERM,
 		.dumpit = ksu_nomount_genl_dump_rules,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 	{
 		.cmd = KSU_NOMOUNT_CMD_GET_VERSION,
 		.flags = GENL_ADMIN_PERM,
 		.doit = ksu_nomount_genl_get_version,
+		KSU_NOMOUNT_OPS_POLICY
 	},
 };
 

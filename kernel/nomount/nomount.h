@@ -2,16 +2,17 @@
 #define __KSU_NOMOUNT_H
 
 #include <linux/fs.h>
+#include <linux/limits.h>
+#include <linux/list.h>
 #include <linux/types.h>
-
-#include "susfs/susfs.h"
 
 #define KSU_NOMOUNT_VERSION 13
 #define KSU_NOMOUNT_GENL_NAME "nomount"
 #define KSU_NOMOUNT_GENL_VERSION 1
 
-#define KSU_NOMOUNT_HASH_BITS 8
+#define KSU_NOMOUNT_HASH_BITS 12
 #define KSU_NOMOUNT_UID_HASH_BITS 4
+#define KSU_NOMOUNT_MAX_PATH PATH_MAX
 
 #define KSU_NOMOUNT_FLAG_IS_DIR (1U << 1)
 #define KSU_NOMOUNT_FLAG_WHITEOUT (1U << 2)
@@ -42,18 +43,27 @@ enum ksu_nomount_attr {
 };
 #define KSU_NOMOUNT_ATTR_MAX (__KSU_NOMOUNT_ATTR_MAX - 1)
 
-enum ksu_nomount_lookup_result {
-	KSU_NOMOUNT_LOOKUP_NONE = 0,
-	KSU_NOMOUNT_LOOKUP_WHITEOUT,
-	KSU_NOMOUNT_LOOKUP_REDIRECT,
-};
-
 struct ksu_nomount_dump_state {
-	int bucket;
-	int index;
+	u32 bucket;
+	u32 index;
 };
 
+/* Stack-owned by branch-link wrappers while a *at() operation resolves a
+ * relative name.  The filename constructor uses the innermost scope so a
+ * directory fd, rather than current->fs->pwd, supplies the base path. */
+struct ksu_nomount_lookup_scope {
+	struct hlist_node node;
+	struct task_struct *task;
+	int dfd;
+	bool active;
+};
+
+struct filename;
+struct inode;
 struct kstat;
+struct kstatfs;
+struct path;
+struct vm_area_struct;
 
 void ksu_nomount_init(void);
 void ksu_nomount_exit(void);
@@ -68,19 +78,35 @@ int ksu_nomount_get_dump_rule(struct ksu_nomount_dump_state *state,
 			      char *virtual_path, size_t virtual_size,
 			      char *real_path, size_t real_size, u32 *flags);
 
-bool ksu_nomount_parent_active(const char *parent_path);
-bool ksu_nomount_dir_is_internal(const char *path);
-bool ksu_nomount_pos_is_magic(loff_t pos);
-bool ksu_nomount_filter_child(const char *parent_path, const char *name,
-				      size_t namelen);
-void ksu_nomount_emit_children(const char *parent_path, struct dir_context *ctx);
-int ksu_nomount_lookup_child(const char *parent_path, const char *name,
-			     size_t namelen, char *real_path,
-			     size_t real_size, struct inode **backend_inode,
-			     unsigned long *ino, unsigned int *d_type,
-			     struct kstat *visible_stat,
-			     bool *has_visible_stat);
+/* Called from the runtime hooks in hooks.c. */
+struct filename *ksu_nomount_handle_getname(struct filename *name);
+void ksu_nomount_lookup_scope_enter(struct ksu_nomount_lookup_scope *scope,
+				    int dfd);
+void ksu_nomount_lookup_scope_exit(struct ksu_nomount_lookup_scope *scope);
+bool ksu_nomount_lookup_scope_matches(int dfd);
+int ksu_nomount_handle_iterate_dir(struct file *file,
+				   struct dir_context *ctx);
+bool ksu_nomount_handle_permission(struct inode *inode, int mask);
+char *ksu_nomount_handle_dpath(const struct path *path, char *buf, int buflen,
+			       const char *native_path);
+void ksu_nomount_handle_getattr(long ret, const struct path *path,
+				struct kstat *stat);
+bool ksu_nomount_getattr_runtime_ready(void);
+void ksu_nomount_handle_fd_getattr(long ret, const struct path *path,
+				   struct kstat *stat);
+void ksu_nomount_handle_stat_result(long ret, unsigned long native_ino,
+				    dev_t native_dev, struct kstat *stat);
+void ksu_nomount_handle_statfs(long ret, const struct path *path,
+			       struct kstatfs *statfs);
+void ksu_nomount_handle_statfs_path(long ret, const struct path *path,
+				    struct kstatfs *statfs);
+bool ksu_nomount_spoof_mmap_metadata(struct inode *inode, dev_t *dev,
+				     unsigned long *ino);
+bool ksu_nomount_active_for_current(void);
+bool ksu_nomount_bypass_active(void);
 
+int ksu_nomount_hooks_init(void);
+void ksu_nomount_hooks_exit(void);
 int ksu_nomount_netlink_init(void);
 void ksu_nomount_netlink_exit(void);
 
