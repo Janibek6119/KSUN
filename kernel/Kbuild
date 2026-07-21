@@ -233,6 +233,10 @@ ifeq ($(shell grep -q "files_lookup_fd_locked" \
 	$(srctree)/include/linux/fdtable.h 2>/dev/null; echo $$?),0)
 ccflags-y += -DKSU_SUSFS_HAS_FILES_LOOKUP_FD_LOCKED
 endif
+ifeq ($(shell grep -q "files_lookup_fd_raw" \
+	$(srctree)/include/linux/fdtable.h 2>/dev/null; echo $$?),0)
+ccflags-y += -DKSU_SUSFS_HAS_FILES_LOOKUP_FD_RAW
+endif
 ifneq ($(wildcard $(srctree)/include/linux/generic-radix-tree.h),)
 ccflags-y += -DKSU_SUSFS_HAS_GENERIC_RADIX_TREE
 endif

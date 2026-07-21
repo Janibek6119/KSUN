@@ -1300,7 +1300,12 @@ static int ksu_susfs_fdinfo_show(struct seq_file *m, void *v)
 		unsigned int fd = proc_fd(m->private);
 
 		spin_lock(&files->file_lock);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) &&	\
+	defined(KSU_SUSFS_HAS_FILES_LOOKUP_FD_RAW)
+		file = files_lookup_fd_raw(files, fd);
+#else
 		file = fcheck_files(files, fd);
+#endif
 		if (file) {
 			struct fdtable *fdt = files_fdtable(files);
 
