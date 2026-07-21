@@ -20,6 +20,14 @@
 #include "susfs/kstat.h"
 #include "susfs/susfs.h"
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+static inline void regs_set_return_value(struct pt_regs *regs,
+					 unsigned long value)
+{
+	regs->regs[0] = value;
+}
+#endif
+
 #define KSU_NOMOUNT_EMBEDDED_NAME_MAX \
 	(KSU_NOMOUNT_MAX_PATH - offsetof(struct filename, iname))
 
