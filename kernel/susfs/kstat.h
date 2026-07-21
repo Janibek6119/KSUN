@@ -12,11 +12,14 @@ void ksu_susfs_kstat_exit(void);
 
 bool ksu_susfs_handle_kstat_compat(unsigned int cmd, void __user *arg);
 bool ksu_susfs_handle_sus_map_compat(void __user *arg);
+bool ksu_susfs_kstat_active_for_current(void);
 
 #ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
 void ksu_susfs_handle_vfs_getattr_nosec(const struct path *path,
 					struct kstat *stat, long ret);
+void ksu_susfs_handle_stat_result(struct kstat *stat, long ret);
 void ksu_susfs_set_getattr_ready(bool ready);
+bool ksu_susfs_kstat_runtime_ready(void);
 #endif
 
 #endif // __KSU_H_SUSFS_KSTAT

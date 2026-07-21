@@ -42,6 +42,9 @@
 #include "infra/symbol_resolver.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+#include "nomount/nomount.h"
+#endif
 #include "policy/allowlist.h"
 #include "selinux/selinux.h"
 #include "susfs/compat.h"
@@ -313,6 +316,11 @@ static bool ksu_susfs_kstat_should_spoof_current(void)
 	return ksu_susfs_proc_mm_view_allowed_current();
 }
 
+bool ksu_susfs_kstat_active_for_current(void)
+{
+	return ksu_susfs_kstat_should_spoof_current();
+}
+
 static bool ksu_susfs_sus_map_should_hide_current(void)
 {
 	if (!static_branch_unlikely(&ksu_susfs_sus_map_enabled)) {
@@ -324,8 +332,16 @@ static bool ksu_susfs_sus_map_should_hide_current(void)
 
 static bool ksu_susfs_proc_maps_view_enabled_current(void)
 {
-	return ksu_susfs_kstat_should_spoof_current() ||
-	       ksu_susfs_sus_map_should_hide_current();
+	if (ksu_susfs_kstat_should_spoof_current() ||
+	    ksu_susfs_sus_map_should_hide_current()) {
+		return true;
+	}
+
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	return ksu_nomount_active_for_current();
+#else
+	return false;
+#endif
 }
 
 static int ksu_susfs_kstat_normalize_path(char *dst, size_t dst_size,
@@ -502,10 +518,12 @@ static bool ksu_susfs_kstat_vma_spoof(struct vm_area_struct *vma, dev_t *dev,
 	struct file *file;
 	struct inode *inode;
 	struct ksu_susfs_kstat_entry *entry;
+	unsigned long native_ino;
+	dev_t native_dev;
+	bool changed = false;
 
-	if (!vma || !dev || !ino || !ksu_susfs_kstat_should_spoof_current()) {
+	if (!vma || !dev || !ino)
 		return false;
-	}
 
 	file = vma->vm_file;
 	if (!file) {
@@ -517,25 +535,33 @@ static bool ksu_susfs_kstat_vma_spoof(struct vm_area_struct *vma, dev_t *dev,
 		return false;
 	}
 
-	*dev = inode->i_sb->s_dev;
-	*ino = inode->i_ino;
+	native_dev = inode->i_sb->s_dev;
+	native_ino = inode->i_ino;
+	*dev = native_dev;
+	*ino = native_ino;
 
-	rcu_read_lock();
-	entry = ksu_susfs_kstat_lookup_rcu(*ino, *dev);
-	if (!entry) {
+	if (ksu_susfs_kstat_should_spoof_current()) {
+		rcu_read_lock();
+		entry = ksu_susfs_kstat_lookup_rcu(native_ino, native_dev);
+		if (entry) {
+			if (entry->flags & KSU_SUSFS_KSTAT_SPOOF_DEV)
+				*dev = entry->spoofed_dev;
+			if (entry->flags & KSU_SUSFS_KSTAT_SPOOF_INO)
+				*ino = entry->spoofed_ino;
+			changed = true;
+		}
 		rcu_read_unlock();
-		return false;
 	}
+	if (ksu_susfs_open_redirect_spoof_inode_identity(inode, dev, ino))
+		changed = true;
 
-	if (entry->flags & KSU_SUSFS_KSTAT_SPOOF_DEV) {
-		*dev = entry->spoofed_dev;
-	}
-	if (entry->flags & KSU_SUSFS_KSTAT_SPOOF_INO) {
-		*ino = entry->spoofed_ino;
-	}
-	rcu_read_unlock();
+	/* The virtual NoMount alias is the final identity exposed for its target. */
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	if (ksu_nomount_spoof_mmap_metadata(inode, dev, ino))
+		changed = true;
+#endif
 
-	return true;
+	return changed;
 }
 
 static bool ksu_susfs_sus_map_match_inode(struct inode *inode)
@@ -585,31 +611,71 @@ ksu_susfs_handle_vfs_getattr_nosec(const struct path *path, struct kstat *stat,
 	struct inode *inode;
 	struct ksu_susfs_kstat_entry *entry;
 
-	if (ret || !ksu_susfs_kstat_should_spoof_current()) {
+	if (ret || !path || !stat || !path->dentry)
 		return;
-	}
-
-	if (!path || !stat || !path->dentry) {
-		return;
-	}
 
 	inode = d_backing_inode(path->dentry);
-	if (!inode) {
+	if (!inode)
 		return;
-	}
 
-	rcu_read_lock();
-	entry = ksu_susfs_kstat_lookup_rcu(inode->i_ino, inode->i_sb->s_dev);
-	if (entry) {
-		ksu_susfs_kstat_apply_spoof(entry, stat);
+	if (ksu_susfs_kstat_should_spoof_current()) {
+		rcu_read_lock();
+		entry = ksu_susfs_kstat_lookup_rcu(inode->i_ino,
+						      inode->i_sb->s_dev);
+		if (entry)
+			ksu_susfs_kstat_apply_spoof(entry, stat);
+		rcu_read_unlock();
 	}
-	rcu_read_unlock();
+	ksu_susfs_open_redirect_apply_kstat(inode, stat);
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	/* NoMount is the final visible identity layer. */
+	ksu_nomount_handle_getattr(ret, path, stat);
+#endif
 }
+
+#ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+/*
+ * Vendor LTO can inline vfs_getattr() into vfs_statx(), bypassing the
+ * vfs_getattr_nosec() branch-link callsite above.  Match the completed kstat
+ * by its native inode/device identity so the userspace stat family still gets
+ * the registered SUSFS metadata.
+ */
+void ksu_susfs_handle_stat_result(struct kstat *stat, long ret)
+{
+	struct ksu_susfs_kstat_entry *entry;
+	unsigned long native_ino;
+	dev_t native_dev;
+	bool open_redirect_applied;
+
+	if (ret || !stat)
+		return;
+	native_ino = stat->ino;
+	native_dev = stat->dev;
+	open_redirect_applied =
+		ksu_susfs_open_redirect_apply_kstat_identity(stat);
+
+	if (!open_redirect_applied && ksu_susfs_kstat_should_spoof_current()) {
+		rcu_read_lock();
+		entry = ksu_susfs_kstat_lookup_rcu(native_ino, native_dev);
+		if (entry)
+			ksu_susfs_kstat_apply_spoof(entry, stat);
+		rcu_read_unlock();
+	}
+#ifdef CONFIG_KSU_KPROBES_NOMOUNT
+	ksu_nomount_handle_stat_result(ret, native_ino, native_dev, stat);
+#endif
+}
+#endif
 
 #ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
 void ksu_susfs_set_getattr_ready(bool ready)
 {
 	ksu_susfs_getattr_ready = ready;
+}
+
+bool ksu_susfs_kstat_runtime_ready(void)
+{
+	return READ_ONCE(ksu_susfs_getattr_ready);
 }
 #endif
 

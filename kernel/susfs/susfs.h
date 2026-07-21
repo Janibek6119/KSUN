@@ -6,6 +6,11 @@
 
 #include "uapi/susfs.h"
 
+struct filename;
+struct kstat;
+struct kstatfs;
+struct path;
+
 #ifndef d_backing_inode
 #define d_backing_inode(dentry) d_inode(dentry)
 #endif
@@ -56,8 +61,22 @@ void ksu_susfs_exit(void);
 bool ksu_susfs_handle_compat(unsigned int cmd, void __user *arg);
 void ksu_susfs_apply_default_rules(void);
 void ksu_susfs_handle_boot_completed(void);
-#ifdef CONFIG_KSU_KPROBES_NOMOUNT
-int ksu_susfs_attach_nomount_parent(const char *path);
-#endif
+bool ksu_susfs_path_filter_active(void);
+bool ksu_susfs_should_hide_path(const char *path, size_t len);
+bool ksu_susfs_relative_hide_rule_may_match(const char *path, size_t len);
+bool ksu_susfs_open_redirect_active(void);
+bool ksu_susfs_open_redirect_runtime_ready(void);
+void ksu_susfs_set_open_redirect_ready(bool ready);
+struct filename *ksu_susfs_open_redirect_getname(struct inode *inode);
+bool ksu_susfs_open_redirect_apply_kstat(struct inode *inode,
+					struct kstat *stat);
+bool ksu_susfs_open_redirect_apply_kstat_identity(struct kstat *stat);
+bool ksu_susfs_open_redirect_spoof_inode_identity(struct inode *inode,
+						  dev_t *dev,
+						  unsigned long *ino);
+bool ksu_susfs_open_redirect_apply_statfs(struct inode *inode,
+					 struct kstatfs *statfs);
+char *ksu_susfs_open_redirect_dpath(const struct path *path, char *buf,
+				    int buflen);
 
 #endif // __KSU_H_SUSFS

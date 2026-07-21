@@ -24,6 +24,7 @@ void ksu_susfs_mark_vfsmount_hidden(struct vfsmount *mnt, bool hide);
 void ksu_susfs_mark_mount_hidden(struct mount *mnt, bool hide);
 void ksu_susfs_handle_cleanup_mnt(struct mount *mnt);
 struct ns_common *ksu_susfs_handle_mntns_get(struct ns_common *orig_ns);
+bool ksu_susfs_mount_runtime_available(void);
 void ksu_susfs_set_mount_runtime_ready(bool ready);
 #endif
 

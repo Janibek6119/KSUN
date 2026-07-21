@@ -1071,6 +1071,11 @@ void ksu_susfs_set_mount_runtime_ready(bool ready)
 {
 	ksu_susfs_mount_runtime_ready = ready;
 }
+
+bool ksu_susfs_mount_runtime_available(void)
+{
+	return READ_ONCE(ksu_susfs_mount_runtime_ready);
+}
 #endif
 
 static int ksu_susfs_mntns_get_handler(struct kretprobe_instance *ri,
