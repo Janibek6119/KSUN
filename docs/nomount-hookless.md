@@ -1,24 +1,12 @@
-# KernelSU Hookless NoMount
+# KernelSU Runtime NoMount
 
-This branch adds a KernelSU-Next-hosted NoMount compatibility layer on top of
-the hookless SUSFS runtime. It is inspired by NoMount's hookless branch at
-`https://github.com/maxsteeel/nomount/tree/experimental/hookless`, the
-branch-link hook work in `https://github.com/backslashxx/KernelSU`, and the
-operation-table shadowing ideas in `https://github.com/Anatdx/Kasumi`, but it
-does not copy NoMount's kernel integration model.
+This tree hosts a NoMount-compatible policy engine inside KernelSU-Next while
+leaving the main kernel `fs/` sources untouched.  "Hookless" here means no
+per-version source patch: the runtime still requires kprobes and kretprobes.
+The behavior is modeled on `maxsteeel/nomount` `master`, not its
+`experimental/hookless` branch.
 
-## Goals
-
-- Keep all NoMount integration inside `KernelSU-Next/kernel/`.
-- Avoid adding `fs/nomount.c` or editing the main kernel `fs/Kconfig` /
-  `fs/Makefile`.
-- Preserve NoMount's Generic Netlink ABI so the existing `nm` userspace binary
-  can continue to talk to the kernel family named `nomount`.
-- Reuse the SUSFS VFS shadow engine instead of stacking a second set of
-  `inode_operations`, `file_operations`, and `super_operations` wrappers.
-- Depend on `KSU_KPROBES_HOOK` through `KSU_KPROBES_SUSFS`.
-
-## Kconfig
+## Configuration
 
 Enable:
 
@@ -28,98 +16,107 @@ CONFIG_KSU_KPROBES_SUSFS=y
 CONFIG_KSU_KPROBES_NOMOUNT=y
 ```
 
-`KSU_KPROBES_NOMOUNT` requires `NET`. The implementation uses the Generic
-Netlink API when it is available, but it does not depend on the
-`GENERIC_NETLINK` Kconfig symbol because some Android kernels expose the
-headers and helpers without that symbol.
+`KSU_KPROBES_NOMOUNT` also requires `NET`.  Android ARM64 4.19 and 5.4 are the
+supported targets.  Initialization is fail-closed: if a required pathname,
+directory, permission, `d_path`, `vfs_getattr_nosec`, or `statfs` probe cannot
+be registered, the Generic Netlink family is not exposed.
 
 ## Architecture
 
-NoMount owns only policy state:
+NoMount owns:
 
-- exact virtual path rules
-- parent directory child arrays used for `readdir`
-- UID block rules
-- Generic Netlink command handling
+- exact virtual-to-real pathname rules and whiteouts
+- RCU-protected directory child arrays
+- real/visible inode identity metadata
+- backend ancestor and private-directory policy
+- UID exclusions
+- the `nomount` Generic Netlink family
 
-SUSFS owns the VFS interception:
+The runtime redirects the two native filename constructors, so every new
+pathname lookup evaluates current policy before the global dcache is used.
+`iterate_dir` is redirected to filter replaced names and emit injected names.
+Kretprobes provide the permission, `d_path`, `vfs_getattr_nosec`, and `statfs`
+behavior used by upstream NoMount.  On ARM64, branch-link syscall wrappers
+also finish `stat*`, `fstat*`, and `statfs*` results when vendor LTO inlines
+the VFS helper and bypasses its return probe.  SUSFS's proc-maps runtime
+provides the remaining mapped-file inode/device metadata view.
 
-- parent directory lookup wrapping
-- parent directory iteration wrapping
-- redirect inode creation
-- superblock lifetime cleanup
+The implementation deliberately does **not** create a front inode, insert a
+synthetic inode into a real filesystem's inode hash, replace a file's mapping,
+or proxy one open file through a second `struct file`.  The retired SUSFS
+NoMount bridge entry points and lookup/readdir branches have been removed, so
+NoMount rules cannot re-enter that unsafe fabricated-inode path.
 
-When `nm add <virtual> <real>` is received, the NoMount layer normalizes the
-paths, validates the real path, asks SUSFS to attach the virtual parent
-directory, then publishes a child entry through an RCU-protected child array.
-Lookup copies the rule data under RCU and lets SUSFS create the transient
-redirect inode.
+## Rule behavior
 
-When `nm w <virtual>` is received, the child is marked as a whiteout. Directory
-iteration filters the original child and lookup returns a negative dentry.
+`nm add <virtual> <real>` resolves the real object with KernelSU credentials,
+records its inode identity and required ancestors, and publishes the rule only
+after its parent directory state is ready.  The real pathname must fit in the
+smallest native `struct filename` allocation; near-`PATH_MAX` backends are
+rejected instead of overwriting the embedded pathname buffer.
 
-When `nm block <uid>` is received, that UID sees the original filesystem. This
-matches upstream NoMount's isolation model and is separate from KernelSU's
-app umount allowlist.
+When the original virtual object exists, only its inode/device/filesystem
+identity is retained.  Size, mode, ownership, blocks, and timestamps continue
+to come from the live backend object.  A missing virtual object receives a
+stable full-width synthetic directory-entry inode number; no inode with that
+number is instantiated.
+
+Missing intermediate virtual directories are represented by internal rules.
+Each needs a distinct existing backend directory identity because readdir has
+only the opened inode, not the original pathname, available at that point.
+Native aliases that resolve to the same parent (for example `/vendor` and
+`/system/vendor`) may share an identical child mapping.  Different child or
+backend mappings on one directory identity are rejected.  Internal rules are
+omitted from `GET_LIST` and pruned when their last child disappears.
+
+Regular-file and symlink rules remain exact child replacements.  A directory
+rule also supplies a recursive backend prefix for descendants, so a lookup
+such as `virtual-dir/child` reaches the matching backend child while readdir
+continues to merge native and injected entries.  Readdir and userspace
+`stat*` wrappers preserve the visible child inode/device view; descriptors and
+`statfs*` use the same path-aware correction.
+
+Backend directories without other-execute permission are tracked by both
+pathname and inode identity.  The temporary permission bridge is bound to the
+specific redirected backend inode and its ancestors, rather than every active
+NoMount rule.  This keeps one virtual pathname from authorizing a different
+private backend through another pathname in the same syscall.
+
+`nm block <uid>` makes that UID bypass all NoMount behavior.  Because policy is
+checked in the filename constructor and in readdir, block/unblock and rule
+deletion do not depend on dropping global dentries.
 
 ## Netlink ABI
 
-The Generic Netlink family remains:
+The public ABI remains:
 
-- family name: `nomount`
-- family version: `1`
-- module ABI version: `13`
+- family name `nomount`
+- family version `1`
+- module ABI version `13`
+- commands `GET_VERSION`, `ADD_RULE`, `DEL_RULE`, `CLEAR_ALL`, `ADD_UID`,
+  `DEL_UID`, and `GET_LIST`
 
-Supported commands:
+String attributes and the existing packed batch format are supported.  Packed
+messages are fully shape-checked before any rule is changed and embedded NULs
+are rejected.  Kbuild inspects the actual Generic Netlink structure layout so
+old kernels receive per-operation policy while newer kernels receive family
+policy.
 
-- `GET_VERSION`
-- `ADD_RULE`
-- `DEL_RULE`
-- `CLEAR_ALL`
-- `ADD_UID`
-- `DEL_UID`
-- `GET_LIST`
+## Compatibility limits
 
-Both the string attributes and NoMount's packed batch payloads are supported.
-The Kbuild probes place the netlink policy on `struct genl_ops` for older
-headers and on `struct genl_family` for newer headers. They also select
-between embedded family ops and legacy `genl_register_family_with_ops()`
-registration, which is the main NoMount hookless compatibility risk on older
-Android kernels.
+- File and symlink rules are exact path rules, matching upstream master.
+  Directory rules intentionally support recursive descendant lookup, but they
+  are not recursive subtree mounts and do not fabricate a VFS inode tree.
+- Relative path reconstruction uses the current working directory only after a
+  NoMount or SUSFS basename candidate is found.  Native filename constructors
+  do not expose a non-`AT_FDCWD` dirfd to this hook.
+- An internal or redirected directory ultimately opens a real backend
+  directory.  Backend directory identities therefore must be unique among
+  active virtual parents, except for compatible native aliases sharing the
+  same child and backend.
+- The target kernel must expose exact probeable symbols for `getname_flags`,
+  `getname_kernel`, `iterate_dir`, `inode_permission`, `generic_permission`,
+  `d_path`, `vfs_getattr_nosec`, and `vfs_statfs`.
 
-## Current Scope
-
-Implemented:
-
-- injection into existing parent directories
-- replacement of existing children
-- whiteout of existing or future children
-- synthetic intermediate virtual directories when the virtual parent path does
-  not exist
-- symlink redirect inodes
-- UID block/unblock
-- rule listing and clear
-- 32-bit compat `readdir` position range
-
-Synthetic ancestors are created as internal NoMount directory rules and are not
-returned by `GET_LIST`. SUSFS uses their visible path for follow-up
-lookup/readdir on nested virtual directories, while the backing path is only a
-staging anchor used to instantiate redirect inodes. Internal synthetic
-directories only expose NoMount children, so fallback anchors like `/` do not
-leak unrelated backend entries into the virtual tree.
-
-Still intentionally avoided:
-
-- NoMount's separate standalone inode/superblock wrapper stack
-- kernel-tree changes under the main `fs/` directories
-
-This keeps NoMount and SUSFS sharing one VFS interception layer instead of
-competing over the same operation tables.
-
-## Legacy Kernel Notes
-
-The primary target is Android ARM64 4.19/5.4 through heavily backported 5.4
-trees. The implementation avoids version-only assumptions where the Generic
-Netlink structure layout is known to vary. Kernels older than 4.19 are not a
-current target because KernelSU's hookless path already needs modern kprobes,
-syscall tracepoints, and Android VFS/procfs surfaces.
+No build, flash, or live-device validation status should be inferred from this
+document; those are separate release checks.

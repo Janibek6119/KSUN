@@ -77,9 +77,21 @@ check_symbol proc_mountinfo_operations
 check_symbol proc_mountstats_operations
 
 printf '\nMount consistency guardrails\n'
-check_symbol ksu_susfs_vfs_create_mount_handler
-check_symbol ksu_susfs_clone_mnt_handler
-check_symbol ksu_susfs_cleanup_mnt_pre
+if rg -q '^CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y$' "$CONFIG_FILE"; then
+	check_symbol ksu_branch_link_patch_init
+	check_symbol ksu_do_filp_open
+	check_symbol ksu_susfs_open_redirect_getname
+	check_symbol ksu_susfs_set_open_redirect_ready
+	check_symbol do_filp_open
+	check_symbol ksu_susfs_set_mount_runtime_ready
+	check_symbol ksu_susfs_should_hide_new_vfsmount
+	check_symbol ksu_susfs_should_hide_cloned_mount
+	check_symbol ksu_susfs_handle_cleanup_mnt
+else
+	check_symbol ksu_susfs_vfs_create_mount_handler
+	check_symbol ksu_susfs_clone_mnt_handler
+	check_symbol ksu_susfs_cleanup_mnt_pre
+fi
 check_symbol ksu_susfs_fdinfo_show
 check_symbol ksu_susfs_visible_mnt_id
 

@@ -76,26 +76,39 @@ kernel patch path.
 
 ### Path and redirect layer
 
-`sus_path` and `open_redirect` are implemented as a local runtime overlay:
+`sus_path` is implemented as a local runtime overlay:
 
 - rules are stored inside `KernelSU-Next`
 - affected parent directories have their `i_op.lookup` replaced
 - affected parent directories have their `i_fop.iterate*` replaced
-- redirected entries are fronted by synthetic inodes backed by real objects
 
-This removes the need for main-kernel edits in generic pathname resolution and
-directory iteration code.
+`open_redirect` uses the ARM64 branch-link runtime when
+`CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y`:
+
+- the runtime locates `do_filp_open()` and patches its syscall callsites
+- the wrapper resolves the visible object without opening or creating it,
+  resolves the inode-keyed rule, then opens the backend pathname
+- `O_TRUNC` and `O_EXCL` retain native create/truncate semantics because the
+  redirect decision never performs a probe open
+- redirect metadata is restored by inode/device-keyed SUSFS kstat and d_path
+  helpers
+
+No synthetic inode, proxy file, or permanent `fs/open.c` change is involved.
+If the required callsite patch cannot be installed, redirect rules fail closed
+with `-EOPNOTSUPP`.
 
 ### Metadata spoofing
 
-`sus_kstat` is split into two cases:
-
-- virtual or redirected entries use the synthetic front-end path
-- standalone files use a KSU-owned compatibility layer
+`sus_kstat` uses inode/device-keyed metadata overlays for redirected backend
+objects and a KSU-owned compatibility layer for standalone files.  In
+branch-link mode, the existing NoMount `vfs_getattr_nosec` return probe also
+dispatches the SUSFS kstat layer for direct callers; ARM64 `stat*`/`fstat*`
+wrappers cover vendor builds that inline that helper.
 
 The standalone compatibility layer currently uses:
 
-- a `vfs_getattr_nosec()` kretprobe
+- a `vfs_getattr_nosec()` kretprobe (or the branch-link stat wrappers when the
+  target callsite is inlined)
 - runtime replacement of proc `maps` and `smaps` `seq_operations.show`
 
 ### Mount hiding
@@ -241,6 +254,8 @@ Enable SUSFS hookless with:
 
 - `CONFIG_KSU_KPROBES_HOOK=y`
 - `CONFIG_KSU_KPROBES_SUSFS=y`
+- `CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y` for `open_redirect` and the direct
+  ARM64 kstat/mount runtime paths
 
 The hookless path is designed to work with kernel-side changes only. It does
 not require a separate manager-side migration to function.
@@ -267,8 +282,8 @@ The compatibility layer covers:
 
 Stock-style ARM64 4.19 and 5.4 trees are the primary legacy compatibility
 targets. The 4.19 lower bound matches the proven range of the branch-link work
-used as a design reference, although this implementation keeps KernelSU-Next's
-dispatcher and does not copy the experimental callsite scanner.
+used as a design reference. This implementation keeps KernelSU-Next's
+dispatcher and hosts its ARM64 callsite scanner entirely inside the KSU runtime.
 
 Linux 4.9 is the lower best-effort source boundary. Its linked-list VMAs, old
 page walker, flex arrays, raw-argument syscall table, and list-based LSM hooks
