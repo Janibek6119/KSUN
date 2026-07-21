@@ -21,6 +21,7 @@
 #include "util.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_identity.h"
+#include "selinux/selinux.h"
 #ifdef CONFIG_KSU_KPROBES_SUSFS
 #include "susfs/susfs.h"
 #endif
@@ -48,6 +49,14 @@ static bool ksu_susfs_may_sleep_now(void)
            !oops_in_progress;
 }
 #endif
+
+#endif
+
+#ifdef CONFIG_KSU_KPROBES_SUSFS
+static bool ksu_susfs_supercall_allowed(void)
+{
+	return current_uid().val == 0 || is_ksu_domain_fast();
+}
 #endif
 
 static int anon_ksu_release(struct inode *inode, struct file *filp)
@@ -187,6 +196,8 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
 
 #ifdef CONFIG_KSU_KPROBES_SUSFS
 	if (magic2 == KSU_SUSFS_MAGIC) {
+		if (!ksu_susfs_supercall_allowed())
+			return 0;
 #ifdef CONFIG_KSU_KPROBES_HOOK
 		ksu_susfs_handle_compat_safely(cmd, *arg, false);
 #else
@@ -356,11 +367,16 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
     }
 
 #ifdef CONFIG_KSU_KPROBES_SUSFS
-    if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_SUSFS_MAGIC) {
-        ksu_susfs_handle_compat_safely(cmd, (void __user *)arg4, true);
-        return 0;
+	if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_SUSFS_MAGIC) {
+		if (!ksu_susfs_supercall_allowed())
+			return 0;
+		ksu_susfs_handle_compat_safely(cmd, (void __user *)arg4, true);
+		return 0;
     }
 #endif
+
+    if (magic1 != KSU_INSTALL_MAGIC1)
+        return 0;
 
     if (magic2 == CHANGE_MANAGER_UID) {
         /* only root is allowed for this command */
