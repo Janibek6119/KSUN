@@ -69,7 +69,7 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
 #else // For older kernels without 4-level paging, the pud is directly under pgd.
     pud = pud_offset(pgd, addr);
 #endif
-    if (pud_none(*pud) || pud_bad(*pud))
+    if (pud_none(*pud))
         goto fail;
     pr_debug("pud of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pud,
              (uintptr_t)pud_val(*pud));
@@ -78,7 +78,14 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
         pr_debug("Address 0x%lx maps to a PUD-level huge page\n", addr);
         return __pud_to_phys(*pud) + ((addr & ~PUD_MASK));
     }
+#elif defined(pud_sect)
+    if (pud_sect(*pud)) {
+        pr_debug("Address 0x%lx maps to a PUD-level section\n", addr);
+        return __pud_to_phys(*pud) + (addr & ~PUD_MASK);
+    }
 #endif
+    if (pud_bad(*pud))
+        goto fail;
 
     pmd = pmd_offset(pud, addr);
     pr_debug("pmd of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pmd,
@@ -87,6 +94,11 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
     if (pmd_leaf(*pmd)) {
         pr_debug("Address 0x%lx maps to a PMD-level huge page\n", addr);
         return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
+    }
+#elif defined(pmd_sect)
+    if (pmd_sect(*pmd)) {
+        pr_debug("Address 0x%lx maps to a PMD-level section\n", addr);
+        return __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
     }
 #endif
 
