@@ -52,6 +52,7 @@
 #define SU_PATH "/system/bin/su"
 #define SH_PATH "/system/bin/sh"
 #define KSU_SU_PATH_WORDS 2
+#define KSU_SU_PATH_PREFIX ((u16)'/' | ((u16)'s' << 8))
 #define KSU_SU_TAIL_MASK 0x00ffffffffffffffULL
 
 bool ksu_su_compat_enabled __read_mostly = true;
@@ -99,14 +100,22 @@ static __always_inline bool
 ksu_sucompat_user_path_matches(const char __user *filename)
 {
 	const u64 *su_words = (const u64 *)su_path_cmp;
+	const char __user *path;
 	const u64 __user *user_words;
+	u16 prefix;
 	u64 word;
 
 	if (!filename)
 		return false;
 
 	BUILD_BUG_ON(sizeof(SU_PATH) + 1 != sizeof(su_path_cmp));
-	user_words = (const u64 __user *)untagged_addr((unsigned long)filename);
+	path = (const char __user *)untagged_addr((unsigned long)filename);
+	if (get_user(prefix, (const u16 __user *)path))
+		return false;
+	if (likely(prefix != KSU_SU_PATH_PREFIX))
+		return false;
+
+	user_words = (const u64 __user *)path;
 
 	if (get_user(word, &user_words[KSU_SU_PATH_WORDS - 1]))
 		return false;
