@@ -35,7 +35,6 @@
 
 #define KSU_BL_SCAN_WIDTH (128 * sizeof(void *))
 #define KSU_BL_MAX_RECORDS 96
-#define KSU_AARCH64_B_OPCODE 0x14000000U
 #define KSU_AARCH64_BL_OPCODE 0x94000000U
 #define KSU_AARCH64_BL_MASK 0xfc000000U
 #define KSU_AARCH64_BRANCH_IMM_MASK 0x03ffffffU
@@ -64,36 +63,28 @@ static unsigned long ksu_bl_lookup(const char *name)
 	return addr;
 }
 
-static bool ksu_aarch64_insn_is_bl(u32 instruction)
+static __always_inline bool ksu_aarch64_insn_is_bl(u32 instruction)
 {
 	return (instruction & KSU_AARCH64_BL_MASK) == KSU_AARCH64_BL_OPCODE;
 }
 
-static bool ksu_aarch64_insn_is_branch_imm(u32 instruction)
+static __always_inline long ksu_aarch64_get_branch_offset(u32 instruction)
 {
-	u32 opcode = instruction & KSU_AARCH64_BL_MASK;
+	u32 imm26 = instruction & KSU_AARCH64_BRANCH_IMM_MASK;
 
-	return opcode == KSU_AARCH64_B_OPCODE ||
-	       opcode == KSU_AARCH64_BL_OPCODE;
-}
-
-static long ksu_aarch64_get_branch_offset(u32 instruction)
-{
-	s32 imm26 = instruction & KSU_AARCH64_BRANCH_IMM_MASK;
-
-	if (imm26 & (1 << 25))
+	if (imm26 & (1U << 25))
 		imm26 |= ~KSU_AARCH64_BRANCH_IMM_MASK;
 
-	return (long)imm26 << 2;
+	return (long)(s32)imm26 * sizeof(u32);
 }
 
-static u32 ksu_aarch64_gen_branch(unsigned long site, unsigned long destination,
-				  bool link)
+static __always_inline u32
+ksu_aarch64_gen_branch(unsigned long site, unsigned long destination)
 {
 	long offset = (long)destination - (long)site;
 	s32 imm26 = (s32)(offset >> 2);
 
-	return (link ? KSU_AARCH64_BL_OPCODE : KSU_AARCH64_B_OPCODE) |
+	return KSU_AARCH64_BL_OPCODE |
 	       (imm26 & KSU_AARCH64_BRANCH_IMM_MASK);
 }
 
@@ -111,7 +102,7 @@ static int ksu_arm64_bl_replace_at(unsigned long site, unsigned long expected,
 	if (copy_from_kernel_nofault(&raw_instruction, (void *)site,
 				     sizeof(raw_instruction)))
 		return -EFAULT;
-	if (!ksu_aarch64_insn_is_branch_imm(raw_instruction))
+	if (!ksu_aarch64_insn_is_bl(raw_instruction))
 		return -EINVAL;
 
 	offset = ksu_aarch64_get_branch_offset(raw_instruction);
@@ -127,8 +118,7 @@ static int ksu_arm64_bl_replace_at(unsigned long site, unsigned long expected,
 	if (delta & 0x3)
 		return -EINVAL;
 
-	instruction = ksu_aarch64_gen_branch(site, replacement,
-					     ksu_aarch64_insn_is_bl(raw_instruction));
+	instruction = ksu_aarch64_gen_branch(site, replacement);
 	ret = ksu_patch_text((void *)site, &instruction, sizeof(instruction),
 			     KSU_PATCH_TEXT_FLUSH_ICACHE);
 	pr_info("branch_link: patch site 0x%lx 0x%lx -> 0x%lx: %d\n",
@@ -154,7 +144,7 @@ static int ksu_arm64_bl_patch(unsigned long start, size_t width,
 		if (copy_from_kernel_nofault(&raw_instruction, (void *)site,
 					     sizeof(raw_instruction)))
 			continue;
-		if (!ksu_aarch64_insn_is_branch_imm(raw_instruction))
+		if (!ksu_aarch64_insn_is_bl(raw_instruction))
 			continue;
 
 		offset = ksu_aarch64_get_branch_offset(raw_instruction);
@@ -395,6 +385,7 @@ static int __nocfi ksu_vfs_fstatat(int dfd, const char __user *filename,
 	ksu_bl_handle_stat_result(stat, ret);
 	return ret;
 }
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 static int (*vfs_statx_fn)(int dfd, struct filename *filename, int flags,
@@ -411,30 +402,6 @@ static int __nocfi ksu_vfs_statx(int dfd, struct filename *filename,
 	ksu_bl_handle_stat_result(stat, ret);
 	return ret;
 }
-#else
-static int (*vfs_statx_fn)(int dfd, const char __user *filename, int flags,
-			   struct kstat *stat, u32 request_mask);
-static int __nocfi ksu_vfs_statx(int dfd, const char __user *filename,
-				 int flags, struct kstat *stat,
-				 u32 request_mask)
-{
-	int ret;
-#ifdef CONFIG_KSU_KPROBES_NOMOUNT
-	struct ksu_nomount_lookup_scope lookup_scope;
-#endif
-
-	ksu_handle_stat(&dfd, &filename, &flags);
-#ifdef CONFIG_KSU_KPROBES_NOMOUNT
-	ksu_nomount_lookup_scope_enter(&lookup_scope, dfd);
-#endif
-	ret = vfs_statx_fn(dfd, filename, flags, stat, request_mask);
-#ifdef CONFIG_KSU_KPROBES_NOMOUNT
-	ksu_nomount_lookup_scope_exit(&lookup_scope);
-#endif
-	ksu_bl_handle_stat_result(stat, ret);
-	return ret;
-}
-#endif
 #else
 static int (*vfs_statx_fn)(int dfd, const char __user *filename, int flags,
 			   struct kstat *stat, u32 request_mask);
@@ -501,7 +468,7 @@ static int __nocfi ksu_vfs_fstat(unsigned int fd, struct kstat *stat)
 	 * vfs_getattr_nosec branch for the old fd-stat patch to replace. */
 	ksu_bl_handle_stat_result(stat, ret);
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
-	if (!ret) {
+	if (!ret && ksu_nomount_active_for_current()) {
 		struct fd f = fdget_raw(fd);
 
 		if (f.file) {
@@ -705,6 +672,8 @@ static bool ksu_branch_link_patch_statfs_family(void)
 	unsigned int path_found = 0, path_patched = 0;
 	unsigned int fd_found = 0, fd_patched = 0;
 	unsigned long target = ksu_bl_lookup("vfs_statfs");
+	unsigned long user_statfs_target = ksu_bl_lookup("user_statfs");
+	unsigned long fd_statfs_target = ksu_bl_lookup("fd_statfs");
 	size_t i;
 
 	vfs_statfs_fn = (void *)target;
@@ -716,7 +685,7 @@ static bool ksu_branch_link_patch_statfs_family(void)
 			continue;
 		path_found++;
 		ret = ksu_bl_record_patch("statfs-path/user_statfs", caller,
-					  ksu_bl_lookup("user_statfs"),
+					  user_statfs_target,
 					  (unsigned long)ksu_user_statfs);
 		if (!ret)
 			path_patched++;
@@ -732,7 +701,7 @@ static bool ksu_branch_link_patch_statfs_family(void)
 			continue;
 		fd_found++;
 		ret = ksu_bl_record_patch("statfs-fd/fd_statfs", caller,
-					  ksu_bl_lookup("fd_statfs"),
+					  fd_statfs_target,
 					  (unsigned long)ksu_fd_statfs);
 		if (!ret)
 			fd_patched++;
@@ -743,12 +712,12 @@ static bool ksu_branch_link_patch_statfs_family(void)
 
 	pr_info("branch_link: statfs family path=%u/%u fd=%u/%u\n",
 		path_patched, path_found, fd_patched, fd_found);
-	return target && path_found && path_found == path_patched &&
+	return target && user_statfs_target && fd_statfs_target &&
+		path_found && path_found == path_patched &&
 		fd_found && fd_found == fd_patched;
 }
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 static int ksu_nomount_rebase_execve_filename(
 	int fd, struct filename **filename_ptr)
@@ -780,6 +749,7 @@ static int ksu_nomount_rebase_execve_filename(
 }
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
 static int (*do_execveat_common_fn)(int fd, struct filename *filename,
 					struct user_arg_ptr argv,
 				    struct user_arg_ptr envp, int flags);
@@ -798,37 +768,6 @@ static int __nocfi ksu_do_execveat_common(int fd, struct filename *filename,
 	return do_execveat_common_fn(fd, filename, argv, envp, flags);
 }
 #else
-#ifdef CONFIG_KSU_KPROBES_NOMOUNT
-static int ksu_nomount_rebase_execve_filename(
-	int fd, struct filename **filename_ptr)
-{
-	struct filename *replacement;
-	struct ksu_nomount_lookup_scope lookup_scope;
-	struct filename *filename;
-
-	if (!filename_ptr || !*filename_ptr || IS_ERR(*filename_ptr) ||
-	    fd == AT_FDCWD)
-		return 0;
-	filename = *filename_ptr;
-	if (!filename->name || !filename->name[0] || filename->name[0] == '/')
-		return 0;
-	if (!ksu_nomount_active_for_current() &&
-	    !ksu_susfs_path_filter_active())
-		return 0;
-	ksu_nomount_lookup_scope_enter(&lookup_scope, fd);
-	replacement = getname_kernel(filename->name);
-	ksu_nomount_lookup_scope_exit(&lookup_scope);
-	if (IS_ERR(replacement)) {
-		putname(filename);
-		*filename_ptr = NULL;
-		return PTR_ERR(replacement);
-	}
-	putname(filename);
-	*filename_ptr = replacement;
-	return 0;
-}
-#endif
-
 static int (*__do_execve_file_fn)(int fd, struct filename *filename,
 				  struct user_arg_ptr argv,
 				  struct user_arg_ptr envp, int flags,

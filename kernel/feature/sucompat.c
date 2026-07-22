@@ -1,6 +1,7 @@
 #include <linux/file.h>
 #include <linux/namei.h>
 #include <linux/version.h>
+#include <linux/build_bug.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 #include <linux/compiler_types.h>
 #endif
@@ -50,6 +51,8 @@
 
 #define SU_PATH "/system/bin/su"
 #define SH_PATH "/system/bin/sh"
+#define KSU_SU_PATH_WORDS 2
+#define KSU_SU_TAIL_MASK 0x00ffffffffffffffULL
 
 bool ksu_su_compat_enabled __read_mostly = true;
 
@@ -75,26 +78,30 @@ static const struct ksu_feature_handler su_compat_handler = {
 };
 
 #ifdef CONFIG_KSU_KPROBES_HOOK
-static const char su_path[] = SU_PATH;
+static const char su_path_cmp[KSU_SU_PATH_WORDS * sizeof(u64)]
+	__aligned(sizeof(u64)) = SU_PATH;
 
-/*
- * The sucompat stat/faccess hooks are on every syscall.  Copy only the
- * exact-length candidate and reject faults/longer names before doing the
- * full comparison; this avoids clearing a second buffer on every call while
- * retaining no-fault behavior for unaligned or invalid user pointers.
- */
 static __always_inline bool
 ksu_sucompat_user_path_matches(const char __user *filename)
 {
-	char path[sizeof(su_path)];
-	long len;
+	const u64 *su_words = (const u64 *)su_path_cmp;
+	const u64 __user *user_words;
+	u64 word;
 
 	if (!filename)
 		return false;
-	len = strncpy_from_user_nofault(path, filename, sizeof(path));
-	if (len != sizeof(su_path) - 1)
+
+	BUILD_BUG_ON(sizeof(SU_PATH) + 1 != sizeof(su_path_cmp));
+	user_words = (const u64 __user *)untagged_addr((unsigned long)filename);
+
+	if (get_user(word, &user_words[KSU_SU_PATH_WORDS - 1]))
 		return false;
-	return !memcmp(path, su_path, sizeof(su_path));
+	if (likely((word & KSU_SU_TAIL_MASK) !=
+		   (su_words[KSU_SU_PATH_WORDS - 1] & KSU_SU_TAIL_MASK)))
+		return false;
+	if (unlikely(get_user(word, &user_words[0])))
+		return false;
+	return word == su_words[0];
 }
 
 static void __user *userspace_stack_buffer(const void *d, size_t len)
@@ -135,12 +142,10 @@ long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
 	long ret;
 	const struct cred *old_cred;
 
-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
-		goto do_orig_facessat;
-	}
-
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
+		goto do_orig_facessat;
 	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
 		old_cred = override_creds(ksu_cred);
 		if (is_ksud_exists()) {
@@ -167,12 +172,10 @@ long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
 	long ret;
 	const struct cred *old_cred;
 
-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
-		goto do_orig_stat;
-	}
-
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
+		goto do_orig_stat;
 	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
 		old_cred = override_creds(ksu_cred);
 		if (is_ksud_exists()) {
@@ -252,11 +255,11 @@ bool ksu_handle_stat_kernel_filename(char *filename)
 
 	if (!ksu_su_compat_enabled)
 		return false;
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
-		return false;
 	if (!filename)
 		return false;
 	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
+		return false;
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
 		return false;
 
 	old_cred = override_creds(ksu_cred);
@@ -276,12 +279,9 @@ bool ksu_handle_stat_kernel_filename(char *filename)
 
 long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, struct pt_regs *regs)
 {
-	const char __user *fn;
 	const char __user *const __user *argv_user = (const char __user *const __user *)PT_REGS_PARM2(regs);
 	struct ksu_sulog_pending_event *pending_sucompat = NULL;
-	char path[sizeof(su_path)];
 	long ret, orig_regs[5];
-	unsigned long addr;
 	int tmp_fd;
 	struct file *ksud_file;
 	const struct cred *old_cred;
@@ -291,18 +291,7 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 
 	if (!ksu_is_allow_uid_for_current(current_uid().val))
 		goto do_orig_execve;
-
-	addr = untagged_addr((unsigned long)*filename_user);
-	fn = (const char __user *)addr;
-	ret = strncpy_from_user(path, fn, sizeof(path));
-
-	if (ret < 0) {
-		pr_warn("Access filename when execve failed: %ld", ret);
-		goto do_orig_execve;
-	}
-
-	if (ret != sizeof(su_path) - 1 ||
-	    likely(memcmp(path, su_path, sizeof(su_path))))
+	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
 		goto do_orig_execve;
 
 	ksu_compat_sulog('x');
@@ -374,16 +363,17 @@ static inline bool ksu_ksud_execve_hook_enabled(void)
 static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename, void *argv)
 {
 	struct path kpath;
-	bool is_allowed = ksu_is_allow_uid_for_current(current_uid().val);
 
 	(void)fd;
 	(void)argv;
 
 	if (!ksu_su_compat_enabled)
 		return 0;
-	if (!is_allowed)
+	if (!filename)
 		return 0;
 	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
+		return 0;
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
 		return 0;
 
 	ksu_compat_sulog('x');
@@ -447,7 +437,7 @@ int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int
 
 int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
 {
-	if (IS_ERR(*filename_ptr))
+	if (!filename_ptr || !*filename_ptr || IS_ERR(*filename_ptr))
 		return 0;
 
 	return ksu_handle_execve(fd, (*filename_ptr)->name, argv, envp, flags);
