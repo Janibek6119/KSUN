@@ -11,6 +11,7 @@
 #endif
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 
 #if defined(__x86_64__) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
@@ -49,24 +50,27 @@ struct compat_sulog_entry {
 } __attribute__((packed));
 
 #define COMPAT_SULOG_MAX 250
-static struct compat_sulog_entry compat_sulog_buf[COMPAT_SULOG_MAX];
+static struct compat_sulog_entry compat_sulog_buf[COMPAT_SULOG_MAX]
+    __aligned(sizeof(u64));
 static uint8_t compat_sulog_idx = 0;
 static DEFINE_SPINLOCK(compat_sulog_lock);
 
 void ksu_compat_sulog(uint8_t sym)
 {
-    struct compat_sulog_entry entry = {0};
-    unsigned int uid = current_uid().val;
-    struct timespec64 ts;
+    struct compat_sulog_entry entry;
+    uint8_t idx;
 
-    ktime_get_boottime_ts64(&ts);
-    entry.s_time = (uint32_t)ts.tv_sec;
-    entry.data = (uint32_t)uid;
-    memcpy((void *)&entry.data + 3, &sym, 1);
+    entry.s_time = (uint32_t)ktime_get_boottime_seconds();
+    entry.data = (uint32_t)current_uid().val | ((uint32_t)sym << 24);
 
     spin_lock(&compat_sulog_lock);
-    compat_sulog_buf[compat_sulog_idx] = entry;
-    compat_sulog_idx = (compat_sulog_idx + 1) % COMPAT_SULOG_MAX;
+    idx = compat_sulog_idx;
+#ifdef CONFIG_64BIT
+    *(u64 *)&compat_sulog_buf[idx] = *(u64 *)&entry;
+#else
+    compat_sulog_buf[idx] = entry;
+#endif
+    compat_sulog_idx = idx + 1 == COMPAT_SULOG_MAX ? 0 : idx + 1;
     spin_unlock(&compat_sulog_lock);
 }
 

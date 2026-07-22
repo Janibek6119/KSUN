@@ -3,6 +3,7 @@
 #include "branch_link_hook.h"
 
 #include <linux/compat.h>
+#include <linux/build_bug.h>
 #include <linux/compiler.h>
 #include <linux/file.h>
 #include <linux/fcntl.h>
@@ -38,6 +39,13 @@
 #define KSU_AARCH64_BL_OPCODE 0x94000000U
 #define KSU_AARCH64_BL_MASK 0xfc000000U
 #define KSU_AARCH64_BRANCH_IMM_MASK 0x03ffffffU
+#define KSU_BL_SU_PATH "/system/bin/su"
+#define KSU_BL_SU_PATH_WORDS 2
+#define KSU_BL_SU_PATH_PREFIX ((u16)'/' | ((u16)'s' << 8))
+#define KSU_BL_SU_TAIL_MASK 0x00ffffffffffffffULL
+
+static const char ksu_bl_su_path_cmp[KSU_BL_SU_PATH_WORDS * sizeof(u64)]
+	__aligned(sizeof(u64)) = KSU_BL_SU_PATH;
 
 struct ksu_bl_record {
 	const char *name;
@@ -61,6 +69,37 @@ static unsigned long ksu_bl_lookup(const char *name)
 
 	pr_info("branch_link: %s=0x%lx\n", name, addr);
 	return addr;
+}
+
+static __always_inline bool ksu_bl_user_path_is_su(const char __user *filename)
+{
+	const u64 *su_words = (const u64 *)ksu_bl_su_path_cmp;
+	const char __user *path;
+	const u64 __user *user_words;
+	u16 prefix;
+	u64 word;
+
+	if (!filename)
+		return false;
+
+	BUILD_BUG_ON(sizeof(KSU_BL_SU_PATH) + 1 !=
+		     sizeof(ksu_bl_su_path_cmp));
+	path = (const char __user *)untagged_addr((unsigned long)filename);
+	if (get_user(prefix, (const u16 __user *)path))
+		return false;
+	if (likely(prefix != KSU_BL_SU_PATH_PREFIX))
+		return false;
+
+	user_words = (const u64 __user *)path;
+	if (get_user(word, &user_words[KSU_BL_SU_PATH_WORDS - 1]))
+		return false;
+	if (likely((word & KSU_BL_SU_TAIL_MASK) !=
+		   (su_words[KSU_BL_SU_PATH_WORDS - 1] &
+		    KSU_BL_SU_TAIL_MASK)))
+		return false;
+	if (unlikely(get_user(word, &user_words[0])))
+		return false;
+	return word == su_words[0];
 }
 
 static __always_inline bool ksu_aarch64_insn_is_bl(u32 instruction)
@@ -278,7 +317,8 @@ static long __nocfi ksu_do_faccessat(int dfd, const char __user *filename,
 	struct ksu_nomount_lookup_scope lookup_scope;
 #endif
 
-	ksu_handle_faccessat(&dfd, &filename, &mode, &flags);
+	if (unlikely(ksu_su_compat_enabled && ksu_bl_user_path_is_su(filename)))
+		ksu_handle_faccessat(&dfd, &filename, &mode, &flags);
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 	ksu_nomount_lookup_scope_enter(&lookup_scope, dfd);
 #endif
@@ -298,7 +338,8 @@ static long __nocfi ksu_do_faccessat(int dfd, const char __user *filename,
 	struct ksu_nomount_lookup_scope lookup_scope;
 #endif
 
-	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+	if (unlikely(ksu_su_compat_enabled && ksu_bl_user_path_is_su(filename)))
+		ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 	ksu_nomount_lookup_scope_enter(&lookup_scope, dfd);
 #endif
@@ -374,7 +415,8 @@ static int __nocfi ksu_vfs_fstatat(int dfd, const char __user *filename,
 	struct ksu_nomount_lookup_scope lookup_scope;
 #endif
 
-	ksu_handle_stat(&dfd, &filename, &flags);
+	if (unlikely(ksu_su_compat_enabled && ksu_bl_user_path_is_su(filename)))
+		ksu_handle_stat(&dfd, &filename, &flags);
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 	ksu_nomount_lookup_scope_enter(&lookup_scope, dfd);
 #endif
@@ -414,7 +456,8 @@ static int __nocfi ksu_vfs_statx(int dfd, const char __user *filename,
 	struct ksu_nomount_lookup_scope lookup_scope;
 #endif
 
-	ksu_handle_stat(&dfd, &filename, &flags);
+	if (unlikely(ksu_su_compat_enabled && ksu_bl_user_path_is_su(filename)))
+		ksu_handle_stat(&dfd, &filename, &flags);
 #ifdef CONFIG_KSU_KPROBES_NOMOUNT
 	ksu_nomount_lookup_scope_enter(&lookup_scope, dfd);
 #endif
