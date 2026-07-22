@@ -65,6 +65,10 @@ static int su_compat_feature_get(u64 *value)
 static int su_compat_feature_set(u64 value)
 {
 	bool enable = value != 0;
+
+	if (enable == ksu_su_compat_enabled)
+		return 0;
+
 	ksu_su_compat_enabled = enable;
 	pr_info("su_compat: set to %d\n", enable);
 	return 0;
@@ -154,25 +158,23 @@ long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
 
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
-	if (!*filename_user)
+	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
 		goto do_orig_facessat;
 	if (!ksu_sucompat_current_allowed())
 		goto do_orig_facessat;
-	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
-		old_cred = override_creds(ksu_cred);
-		if (is_ksud_exists()) {
-			ksu_compat_sulog('a');
-			pr_info("faccessat su->ksud!\n");
-			orig_filename = *filename_user;
-			*filename_user = ksud_user_path();
-			ret = ksu_invoke_syscall_nr(orig_nr, regs);
-			revert_creds(old_cred);
-			*filename_user = orig_filename;
-			return ret;
-		} else {
-			revert_creds(old_cred);
-		}
+	old_cred = override_creds(ksu_cred);
+	if (!is_ksud_exists()) {
+		revert_creds(old_cred);
+		goto do_orig_facessat;
 	}
+	ksu_compat_sulog('a');
+	pr_info("faccessat su->ksud!\n");
+	orig_filename = *filename_user;
+	*filename_user = ksud_user_path();
+	ret = ksu_invoke_syscall_nr(orig_nr, regs);
+	revert_creds(old_cred);
+	*filename_user = orig_filename;
+	return ret;
 
 do_orig_facessat:
 	return ksu_invoke_syscall_nr(orig_nr, regs);
@@ -186,25 +188,23 @@ long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
 
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
-	if (!*filename_user)
+	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
 		goto do_orig_stat;
 	if (!ksu_sucompat_current_allowed())
 		goto do_orig_stat;
-	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
-		old_cred = override_creds(ksu_cred);
-		if (is_ksud_exists()) {
-			ksu_compat_sulog('s');
-			pr_info("newfstatat su->ksud!\n");
-			orig_filename = *filename_user;
-			*filename_user = ksud_user_path();
-			ret = ksu_invoke_syscall_nr(orig_nr, regs);
-			revert_creds(old_cred);
-			*filename_user = orig_filename;
-			return ret;
-		} else {
-			revert_creds(old_cred);
-		}
+	old_cred = override_creds(ksu_cred);
+	if (!is_ksud_exists()) {
+		revert_creds(old_cred);
+		goto do_orig_stat;
 	}
+	ksu_compat_sulog('s');
+	pr_info("newfstatat su->ksud!\n");
+	orig_filename = *filename_user;
+	*filename_user = ksud_user_path();
+	ret = ksu_invoke_syscall_nr(orig_nr, regs);
+	revert_creds(old_cred);
+	*filename_user = orig_filename;
+	return ret;
 
 do_orig_stat:
 	return ksu_invoke_syscall_nr(orig_nr, regs);
@@ -217,14 +217,14 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 	const struct cred *old_cred;
 	bool exists;
 
-	if (!ksu_su_compat_enabled)
+	if (unlikely(!ksu_su_compat_enabled))
 		return false;
-	if (!filename_user || !*filename_user)
-		return false;
-	if (!ksu_sucompat_current_allowed())
+	if (!filename_user)
 		return false;
 
 	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
+		return false;
+	if (!ksu_sucompat_current_allowed())
 		return false;
 
 	old_cred = override_creds(ksu_cred);
@@ -267,7 +267,7 @@ bool ksu_handle_stat_kernel_filename(char *filename)
 	const struct cred *old_cred;
 	bool exists;
 
-	if (!ksu_su_compat_enabled)
+	if (unlikely(!ksu_su_compat_enabled))
 		return false;
 	if (!filename)
 		return false;
@@ -305,9 +305,9 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 	if (unlikely(!*filename_user))
 		goto do_orig_execve;
 
-	if (!ksu_sucompat_current_allowed())
-		goto do_orig_execve;
 	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
+		goto do_orig_execve;
+	if (!ksu_sucompat_current_allowed())
 		goto do_orig_execve;
 
 	ksu_compat_sulog('x');
@@ -383,7 +383,7 @@ static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename,
 	(void)fd;
 	(void)argv;
 
-	if (!ksu_su_compat_enabled)
+	if (unlikely(!ksu_su_compat_enabled))
 		return 0;
 	if (!filename)
 		return 0;
