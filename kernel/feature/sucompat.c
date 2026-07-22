@@ -77,6 +77,16 @@ static const struct ksu_feature_handler su_compat_handler = {
 	.set_handler = su_compat_feature_set,
 };
 
+static __always_inline bool ksu_sucompat_current_allowed(void)
+{
+	uid_t uid = current_uid().val;
+
+	if (!uid)
+		return is_ksu_domain_fast() || unlikely(is_ksu_domain());
+
+	return __ksu_is_allow_uid(uid);
+}
+
 #ifdef CONFIG_KSU_KPROBES_HOOK
 static const char su_path_cmp[KSU_SU_PATH_WORDS * sizeof(u64)]
 	__aligned(sizeof(u64)) = SU_PATH;
@@ -144,7 +154,9 @@ long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
 
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
+	if (!*filename_user)
+		goto do_orig_facessat;
+	if (!ksu_sucompat_current_allowed())
 		goto do_orig_facessat;
 	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
 		old_cred = override_creds(ksu_cred);
@@ -174,7 +186,9 @@ long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
 
 	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
 
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
+	if (!*filename_user)
+		goto do_orig_stat;
+	if (!ksu_sucompat_current_allowed())
 		goto do_orig_stat;
 	if (unlikely(ksu_sucompat_user_path_matches(*filename_user))) {
 		old_cred = override_creds(ksu_cred);
@@ -205,9 +219,9 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 
 	if (!ksu_su_compat_enabled)
 		return false;
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
-		return false;
 	if (!filename_user || !*filename_user)
+		return false;
+	if (!ksu_sucompat_current_allowed())
 		return false;
 
 	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
@@ -259,7 +273,7 @@ bool ksu_handle_stat_kernel_filename(char *filename)
 		return false;
 	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
 		return false;
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
+	if (!ksu_sucompat_current_allowed())
 		return false;
 
 	old_cred = override_creds(ksu_cred);
@@ -288,8 +302,10 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 
 	if (unlikely(!filename_user))
 		goto do_orig_execve;
+	if (unlikely(!*filename_user))
+		goto do_orig_execve;
 
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
+	if (!ksu_sucompat_current_allowed())
 		goto do_orig_execve;
 	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
 		goto do_orig_execve;
@@ -373,7 +389,7 @@ static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename,
 		return 0;
 	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
 		return 0;
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
+	if (!ksu_sucompat_current_allowed())
 		return 0;
 
 	ksu_compat_sulog('x');
