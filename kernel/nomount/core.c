@@ -14,7 +14,9 @@
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/namei.h>
+#include <linux/overflow.h>
 #include <linux/rculist.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
@@ -38,6 +40,7 @@
 #define KSU_NOMOUNT_EMBEDDED_NAME_MAX \
 	(KSU_NOMOUNT_MAX_PATH - offsetof(struct filename, iname))
 #define KSU_NOMOUNT_CHILD_NATIVE (1U << 0)
+#define KSU_NOMOUNT_CHILD_DELETED (1U << 7)
 /* kern_path() leaves the terminal symlink unresolved when LOOKUP_FOLLOW is
  * absent.  Linux has no portable LOOKUP_NOFOLLOW flag, including this 5.4
  * tree, so give the zero-flags form an explicit local name. */
@@ -45,7 +48,9 @@
 
 struct ksu_nomount_child {
 	unsigned long ino;
-	u16 name_offset;
+	u32 name_offset;
+	u32 name_hash;
+	u16 name_len;
 	u8 d_type;
 	u8 flags;
 };
@@ -53,7 +58,10 @@ struct ksu_nomount_child {
 struct ksu_nomount_child_array {
 	atomic_t refcnt;
 	u32 num_children;
+	u32 live_children;
+	u32 child_capacity;
 	u32 heap_size;
+	u32 heap_capacity;
 	struct rcu_head rcu;
 	struct ksu_nomount_child entries[];
 };
@@ -90,15 +98,18 @@ struct ksu_nomount_parent_identity {
 
 struct ksu_nomount_private_path {
 	struct list_head node;
+	struct hlist_node hash_node;
 	unsigned long ino;
 	dev_t dev;
 	u16 len;
+	u32 hash;
 	char *path;
 };
 
 struct ksu_nomount_rule {
 	struct hlist_node path_node;
 	struct hlist_node real_node;
+	struct hlist_node real_path_node;
 	struct hlist_node basename_node;
 	struct list_head gc_node;
 	struct ksu_nomount_parent *parent;
@@ -109,7 +120,9 @@ struct ksu_nomount_rule {
 	u16 virtual_len;
 	u16 real_len;
 	u16 basename_len;
+	u32 child_index;
 	u32 hash;
+	u32 real_hash;
 	u32 basename_hash;
 	u32 flags;
 	unsigned long visible_ino;
@@ -162,13 +175,17 @@ struct ksu_nomount_iter_ctx {
 	struct dir_context ctx;
 	struct dir_context *orig_ctx;
 	struct ksu_nomount_child_array *children;
+	unsigned long parent_ino;
 	unsigned long visible_ino;
 	unsigned long parent_visible_ino;
+	dev_t parent_dev;
 };
 
 static DEFINE_HASHTABLE(ksu_nomount_rules, KSU_NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_nomount_real_inodes, KSU_NOMOUNT_HASH_BITS);
+static DEFINE_HASHTABLE(ksu_nomount_real_paths, KSU_NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_nomount_basenames, KSU_NOMOUNT_HASH_BITS);
+static DEFINE_HASHTABLE(ksu_nomount_private_paths_hash, KSU_NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_nomount_parents, KSU_NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_nomount_parent_inodes, KSU_NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(ksu_nomount_uids, KSU_NOMOUNT_UID_HASH_BITS);
@@ -755,15 +772,42 @@ static bool ksu_nomount_relative_rule_may_match(const char *path, size_t len)
 	return found;
 }
 
-static bool ksu_nomount_path_is_private_rcu(const char *path, size_t len)
+static bool
+ksu_nomount_private_path_exists_rcu(const char *path, size_t len)
 {
 	struct ksu_nomount_private_path *private;
+	const char *private_path;
+	u32 hash = ksu_nomount_hash_path_len(path, len);
 
-	list_for_each_entry_rcu(private, &ksu_nomount_private_paths, node) {
-		if (len < private->len ||
-		    memcmp(path, private->path, private->len))
-			continue;
-		if (len == private->len || path[private->len] == '/')
+	hash_for_each_possible_rcu(ksu_nomount_private_paths_hash, private,
+				   hash_node, hash) {
+		private_path = READ_ONCE(private->path);
+		if (READ_ONCE(private->hash) == hash &&
+		    READ_ONCE(private->len) == len &&
+		    !memcmp(private_path, path, len))
+			return true;
+	}
+
+	return false;
+}
+
+static bool ksu_nomount_path_is_private_rcu(const char *path, size_t len)
+{
+	size_t end = len;
+
+	if (!path || !len)
+		return false;
+
+	if (ksu_nomount_private_path_exists_rcu(path, len))
+		return true;
+
+	while (end > 1) {
+		while (end > 1 && path[end - 1] != '/')
+			end--;
+		if (end <= 1)
+			break;
+		end--;
+		if (ksu_nomount_private_path_exists_rcu(path, end))
 			return true;
 	}
 
@@ -785,10 +829,31 @@ static struct ksu_nomount_rule *
 ksu_nomount_find_rule_rcu_len(const char *path, size_t len)
 {
 	struct ksu_nomount_rule *rule;
-	u32 hash = ksu_nomount_hash_path_len(path, len);
+	const char *name;
+	const char *end = path + len;
+	size_t name_len;
+	u32 hash;
 
-	hash_for_each_possible_rcu(ksu_nomount_rules, rule, path_node, hash) {
-		if (rule->hash == hash && rule->virtual_len == len &&
+	if (!path || !len)
+		return NULL;
+	name = end;
+	while (name > path && name[-1] != '/')
+		name--;
+	if (name == path || name == end)
+		return NULL;
+	name_len = end - name;
+	hash = ksu_nomount_hash_path_len(name, name_len);
+
+	/*
+	 * The basename index is already maintained for relative lookups and
+	 * readdir suppression.  Use it as the runtime path index too: a full
+	 * pathname hash is unnecessary when the basename bucket has no candidate.
+	 */
+	hash_for_each_possible_rcu(ksu_nomount_basenames, rule, basename_node,
+				   hash) {
+		if (rule->basename_hash == hash &&
+		    rule->basename_len == name_len &&
+		    rule->virtual_len == len &&
 		    !memcmp(rule->virtual_path, path, len))
 			return rule;
 	}
@@ -834,31 +899,43 @@ ksu_nomount_find_real_rule_identity_rcu(unsigned long ino, dev_t dev)
 }
 
 static struct ksu_nomount_rule *
-ksu_nomount_find_real_dir_prefix_rule_rcu(const char *path, size_t len,
-						 size_t *prefix_len)
+ksu_nomount_find_real_rule_rcu_len(const char *path, size_t len)
 {
 	struct ksu_nomount_rule *rule;
-	struct ksu_nomount_rule *best = NULL;
-	size_t best_len = 0;
-	int bucket;
+	u32 hash = ksu_nomount_hash_path_len(path, len);
 
-	hash_for_each_rcu(ksu_nomount_rules, bucket, rule, path_node) {
-		size_t real_len;
-
-		if (rule->d_type != DT_DIR ||
-		    (READ_ONCE(rule->flags) & KSU_NOMOUNT_FLAG_WHITEOUT))
-			continue;
-		real_len = READ_ONCE(rule->real_len);
-		if (real_len <= best_len || real_len >= len ||
-		    path[real_len] != '/' ||
-		    memcmp(path, rule->real_path, real_len))
-			continue;
-		best = rule;
-		best_len = real_len;
+	hash_for_each_possible_rcu(ksu_nomount_real_paths, rule,
+				   real_path_node, hash) {
+		if (rule->real_hash == hash && rule->real_len == len &&
+		    !memcmp(rule->real_path, path, len))
+			return rule;
 	}
-	if (best && prefix_len)
-		*prefix_len = best_len;
-	return best;
+	return NULL;
+}
+
+static struct ksu_nomount_rule *
+ksu_nomount_find_real_dir_prefix_rule_rcu(const char *path, size_t len,
+					  size_t *prefix_len)
+{
+	size_t end = len;
+
+	while (end > 1) {
+		struct ksu_nomount_rule *rule;
+
+		while (end > 1 && path[end - 1] != '/')
+			end--;
+		if (end <= 1)
+			break;
+		end--;
+		rule = ksu_nomount_find_real_rule_rcu_len(path, end);
+		if (rule && rule->d_type == DT_DIR &&
+		    !(READ_ONCE(rule->flags) & KSU_NOMOUNT_FLAG_WHITEOUT)) {
+			if (prefix_len)
+				*prefix_len = end;
+			return rule;
+		}
+	}
+	return NULL;
 }
 
 static struct ksu_nomount_rule *
@@ -900,15 +977,73 @@ static bool ksu_nomount_path_has_children_locked(const char *path)
 		return false;
 	children = rcu_dereference_protected(
 		parent->children, lockdep_is_held(&ksu_nomount_lock));
-	return children && children->num_children;
+	return children && children->live_children;
 }
 
 static const char *
 ksu_nomount_child_name(const struct ksu_nomount_child_array *array,
 		       const struct ksu_nomount_child *child)
 {
-	return (const char *)&array->entries[array->num_children] +
-	       child->name_offset;
+	return (const char *)&array->entries[array->child_capacity] +
+	       READ_ONCE(child->name_offset);
+}
+
+static __always_inline u32
+ksu_nomount_child_count(const struct ksu_nomount_child_array *array)
+{
+	return smp_load_acquire(&array->num_children);
+}
+
+static __always_inline u8
+ksu_nomount_child_flags_rcu(const struct ksu_nomount_child *child)
+{
+	return smp_load_acquire(&child->flags);
+}
+
+static struct ksu_nomount_child_array *
+ksu_nomount_alloc_child_array(u32 child_capacity, u32 heap_capacity)
+{
+	struct ksu_nomount_child_array *array;
+	size_t entries_size;
+	size_t total;
+
+	if (check_mul_overflow((size_t)child_capacity,
+			       sizeof(struct ksu_nomount_child),
+			       &entries_size))
+		return NULL;
+	if (check_add_overflow(sizeof(*array), entries_size, &total))
+		return NULL;
+	if (check_add_overflow(total, (size_t)heap_capacity, &total))
+		return NULL;
+	array = kvzalloc(total, GFP_KERNEL);
+	if (!array)
+		return NULL;
+	atomic_set(&array->refcnt, 1);
+	array->child_capacity = child_capacity;
+	array->heap_capacity = heap_capacity;
+	return array;
+}
+
+static u32 ksu_nomount_next_child_capacity(u32 need)
+{
+	u32 cap = 8;
+
+	while (cap < need && cap < KSU_NOMOUNT_MAGIC_WINDOW)
+		cap <<= 1;
+	if (cap < need)
+		cap = need;
+	return cap;
+}
+
+static u32 ksu_nomount_next_heap_capacity(u32 need)
+{
+	u32 cap = 256;
+
+	while (cap < need && cap <= (U32_MAX >> 1))
+		cap <<= 1;
+	if (cap < need)
+		cap = need;
+	return cap;
 }
 
 static u8 ksu_nomount_child_flags(u32 flags, bool visible_exists)
@@ -922,84 +1057,201 @@ static u8 ksu_nomount_child_flags(u32 flags, bool visible_exists)
 }
 
 static void
-ksu_nomount_child_array_put(struct ksu_nomount_child_array *array)
+ksu_nomount_child_array_rcu_free(struct rcu_head *rcu)
+{
+	struct ksu_nomount_child_array *array =
+		container_of(rcu, struct ksu_nomount_child_array, rcu);
+
+	kvfree(array);
+}
+
+static void ksu_nomount_child_array_put(struct ksu_nomount_child_array *array)
 {
 	if (array && atomic_dec_and_test(&array->refcnt))
-		kfree_rcu(array, rcu);
+		call_rcu(&array->rcu, ksu_nomount_child_array_rcu_free);
 }
 
 static int
 ksu_nomount_replace_child_array_locked(struct ksu_nomount_parent *parent,
-				       const struct ksu_nomount_rule *rule)
+				       struct ksu_nomount_rule *rule,
+				       const struct ksu_nomount_rule *known_child)
 {
 	struct ksu_nomount_child_array *old_array;
 	struct ksu_nomount_child_array *new_array;
 	const char *old_heap = NULL;
 	char *new_heap;
-	u32 old_num = 0, old_heap_size = 0, new_num, new_heap_size;
+	u32 old_num = 0, old_live = 0, old_heap_size = 0;
+	u32 new_num, new_live, new_heap_size;
 	int replace_idx = -1;
-	size_t name_len = strlen(rule->name);
-	size_t total;
+	int free_idx = -1;
+	size_t name_len = rule->basename_len;
 	u32 i;
 
 	old_array = rcu_dereference_protected(
 		parent->children, lockdep_is_held(&ksu_nomount_lock));
 	if (old_array) {
-		old_num = old_array->num_children;
-		old_heap_size = old_array->heap_size;
-		old_heap = (const char *)&old_array->entries[old_num];
-		for (i = 0; i < old_num; i++) {
-			if (!strcmp(ksu_nomount_child_name(
-					    old_array, &old_array->entries[i]),
-				    rule->name)) {
+		old_num = READ_ONCE(old_array->num_children);
+		old_live = READ_ONCE(old_array->live_children);
+		old_heap_size = READ_ONCE(old_array->heap_size);
+		old_heap = (const char *)&old_array->entries[old_array->child_capacity];
+		if (known_child && known_child->parent == parent) {
+			u32 idx = READ_ONCE(known_child->child_index);
+
+			if (idx < old_num) {
+				const struct ksu_nomount_child *entry =
+					&old_array->entries[idx];
+				u8 flags = READ_ONCE(entry->flags);
+
+				if (!(flags & KSU_NOMOUNT_CHILD_DELETED) &&
+				    READ_ONCE(entry->name_hash) ==
+					    rule->basename_hash &&
+				    READ_ONCE(entry->name_len) == name_len &&
+				    !memcmp(ksu_nomount_child_name(old_array,
+								   entry),
+					    rule->name, name_len))
+					replace_idx = idx;
+			}
+		}
+		for (i = 0;
+		     replace_idx < 0 && old_live < old_num && i < old_num;
+		     i++) {
+			const struct ksu_nomount_child *entry =
+				&old_array->entries[i];
+			u8 flags = READ_ONCE(entry->flags);
+
+			if (flags & KSU_NOMOUNT_CHILD_DELETED) {
+				if (free_idx < 0)
+					free_idx = i;
+				continue;
+			}
+			if (READ_ONCE(entry->name_hash) !=
+			    rule->basename_hash)
+				continue;
+			if (READ_ONCE(entry->name_len) != name_len)
+				continue;
+			if (!memcmp(ksu_nomount_child_name(old_array, entry),
+				    rule->name, name_len)) {
 				replace_idx = i;
 				break;
 			}
 		}
 	}
 
-	new_num = replace_idx >= 0 ? old_num : old_num + 1;
-	if (new_num >= KSU_NOMOUNT_MAGIC_WINDOW || name_len > U16_MAX)
+	new_num = old_num;
+	new_live = old_live;
+	if (replace_idx < 0) {
+		if (name_len > U16_MAX)
+			return -E2BIG;
+		if (free_idx < 0)
+			new_num++;
+		new_live++;
+	}
+	if (new_num >= KSU_NOMOUNT_MAGIC_WINDOW)
 		return -E2BIG;
-	new_heap_size = replace_idx >= 0 ? old_heap_size :
-							 old_heap_size + name_len + 1;
-	if (new_heap_size < old_heap_size)
-		return -EOVERFLOW;
-	if (old_heap_size > U16_MAX || new_heap_size > U16_MAX)
-		return -E2BIG;
-	total = sizeof(*new_array) +
-		new_num * sizeof(struct ksu_nomount_child) + new_heap_size;
-	if (total < new_heap_size)
-		return -EOVERFLOW;
-
-	new_array = kmalloc(total, GFP_KERNEL);
+	new_heap_size = old_heap_size;
+	if (replace_idx < 0) {
+		if (old_heap_size > U32_MAX - name_len - 1)
+			return -EOVERFLOW;
+		new_heap_size += name_len + 1;
+	}
+	if (old_array && replace_idx < 0 && free_idx >= 0) {
+		if (old_heap_size + name_len + 1 > old_array->heap_capacity) {
+			free_idx = -1;
+			new_num = old_num + 1;
+		}
+	}
+	if (old_array && replace_idx < 0 && free_idx >= 0) {
+		new_array = old_array;
+		new_heap = (char *)&new_array->entries[new_array->child_capacity];
+		rule->child_index = free_idx;
+		WRITE_ONCE(new_array->entries[free_idx].ino,
+			   rule->visible_ino);
+		WRITE_ONCE(new_array->entries[free_idx].name_len,
+			   (u16)name_len);
+		WRITE_ONCE(new_array->entries[free_idx].name_hash,
+			   rule->basename_hash);
+		WRITE_ONCE(new_array->entries[free_idx].d_type, rule->d_type);
+		WRITE_ONCE(new_array->entries[free_idx].name_offset,
+			   old_heap_size);
+		memcpy(new_heap + old_heap_size, rule->name, name_len + 1);
+		WRITE_ONCE(new_array->heap_size, old_heap_size + name_len + 1);
+		WRITE_ONCE(new_array->live_children, new_live);
+		smp_store_release(&new_array->entries[free_idx].flags,
+				  ksu_nomount_child_flags(rule->flags,
+							  rule->visible_exists));
+		return 0;
+	}
+	if (old_array && replace_idx < 0 && old_num < old_array->child_capacity &&
+	    old_heap_size + name_len + 1 <= old_array->heap_capacity) {
+		new_array = old_array;
+		new_heap = (char *)&new_array->entries[new_array->child_capacity];
+		rule->child_index = old_num;
+		WRITE_ONCE(new_array->entries[old_num].ino,
+			   rule->visible_ino);
+		WRITE_ONCE(new_array->entries[old_num].name_len,
+			   (u16)name_len);
+		WRITE_ONCE(new_array->entries[old_num].name_hash,
+			   rule->basename_hash);
+		WRITE_ONCE(new_array->entries[old_num].d_type, rule->d_type);
+		WRITE_ONCE(new_array->entries[old_num].name_offset,
+			   old_heap_size);
+		memcpy(new_heap + old_heap_size, rule->name, name_len + 1);
+		WRITE_ONCE(new_array->entries[old_num].flags,
+			   ksu_nomount_child_flags(rule->flags,
+						   rule->visible_exists));
+		WRITE_ONCE(new_array->heap_size, old_heap_size + name_len + 1);
+		WRITE_ONCE(new_array->live_children, new_live);
+		smp_store_release(&new_array->num_children, old_num + 1);
+		return 0;
+	}
+	new_array = ksu_nomount_alloc_child_array(
+		ksu_nomount_next_child_capacity(new_num),
+		ksu_nomount_next_heap_capacity(new_heap_size));
 	if (!new_array)
 		return -ENOMEM;
-	atomic_set(&new_array->refcnt, 1);
 	new_array->num_children = new_num;
+	new_array->live_children = new_live;
 	new_array->heap_size = new_heap_size;
-	new_heap = (char *)&new_array->entries[new_num];
-
-	if (old_num)
+	new_heap = (char *)&new_array->entries[new_array->child_capacity];
+	if (old_array && old_num) {
 		memcpy(new_array->entries, old_array->entries,
 		       old_num * sizeof(struct ksu_nomount_child));
-	if (old_heap_size)
-		memcpy(new_heap, old_heap, old_heap_size);
-
+		if (old_heap_size)
+			memcpy(new_heap, old_heap, old_heap_size);
+	}
 	if (replace_idx >= 0) {
 		new_array->entries[replace_idx].ino = rule->visible_ino;
+		new_array->entries[replace_idx].name_len = (u16)name_len;
+		new_array->entries[replace_idx].name_hash =
+			rule->basename_hash;
 		new_array->entries[replace_idx].d_type = rule->d_type;
 		new_array->entries[replace_idx].flags =
 			ksu_nomount_child_flags(rule->flags, rule->visible_exists);
-	} else {
-		struct ksu_nomount_child *child = &new_array->entries[old_num];
+		rule->child_index = replace_idx;
+	} else if (free_idx >= 0 && old_array) {
+		struct ksu_nomount_child *child = &new_array->entries[free_idx];
 
 		child->ino = rule->visible_ino;
+		child->name_len = (u16)name_len;
+		child->name_hash = rule->basename_hash;
 		child->name_offset = old_heap_size;
 		child->d_type = rule->d_type;
 		child->flags = ksu_nomount_child_flags(rule->flags,
 						      rule->visible_exists);
 		memcpy(new_heap + old_heap_size, rule->name, name_len + 1);
+		rule->child_index = free_idx;
+	} else {
+		struct ksu_nomount_child *child = &new_array->entries[old_num];
+
+		child->ino = rule->visible_ino;
+		child->name_len = (u16)name_len;
+		child->name_hash = rule->basename_hash;
+		child->name_offset = old_heap_size;
+		child->d_type = rule->d_type;
+		child->flags = ksu_nomount_child_flags(rule->flags,
+						      rule->visible_exists);
+		memcpy(new_heap + old_heap_size, rule->name, name_len + 1);
+		rule->child_index = old_num;
 	}
 	rcu_assign_pointer(parent->children, new_array);
 	ksu_nomount_child_array_put(old_array);
@@ -1008,64 +1260,38 @@ ksu_nomount_replace_child_array_locked(struct ksu_nomount_parent *parent,
 
 static int
 ksu_nomount_delete_child_locked(struct ksu_nomount_parent *parent,
-				const char *name)
+				const struct ksu_nomount_rule *rule)
 {
-	struct ksu_nomount_child_array *old_array, *new_array;
-	char *new_heap;
-	int found = -1;
-	u32 num, new_heap_size = 0, current_offset = 0, src, dst = 0;
-	size_t total;
+	struct ksu_nomount_child_array *old_array;
+	struct ksu_nomount_child *entry;
+	u32 idx;
+	u32 live_children;
+	u8 flags;
 
 	old_array = rcu_dereference_protected(
 		parent->children, lockdep_is_held(&ksu_nomount_lock));
 	if (!old_array)
 		return 0;
-	num = old_array->num_children;
-	for (src = 0; src < num; src++) {
-		const char *child = ksu_nomount_child_name(
-			old_array, &old_array->entries[src]);
-
-		if (!strcmp(child, name)) {
-			found = src;
-			continue;
-		}
-		new_heap_size += strlen(child) + 1;
-	}
-	if (found < 0)
+	idx = READ_ONCE(rule->child_index);
+	if (idx >= old_array->num_children)
 		return 0;
-	if (num == 1) {
+	entry = &old_array->entries[idx];
+	flags = READ_ONCE(entry->flags);
+	if (flags & KSU_NOMOUNT_CHILD_DELETED)
+		return 0;
+	if (READ_ONCE(entry->name_hash) != rule->basename_hash ||
+	    READ_ONCE(entry->name_len) != rule->basename_len ||
+	    memcmp(ksu_nomount_child_name(old_array, entry), rule->name,
+		   rule->basename_len))
+		return 0;
+	live_children = old_array->live_children;
+	if (live_children <= 1) {
 		rcu_assign_pointer(parent->children, NULL);
 		ksu_nomount_child_array_put(old_array);
 		return 0;
 	}
-
-	total = sizeof(*new_array) +
-		(num - 1) * sizeof(struct ksu_nomount_child) + new_heap_size;
-	new_array = kmalloc(total, GFP_KERNEL);
-	if (!new_array)
-		return -ENOMEM;
-	atomic_set(&new_array->refcnt, 1);
-	new_array->num_children = num - 1;
-	new_array->heap_size = new_heap_size;
-	new_heap = (char *)&new_array->entries[num - 1];
-
-	for (src = 0; src < num; src++) {
-		const char *child;
-		size_t len;
-
-		if (src == found)
-			continue;
-		child = ksu_nomount_child_name(old_array,
-					       &old_array->entries[src]);
-		len = strlen(child);
-		new_array->entries[dst] = old_array->entries[src];
-		new_array->entries[dst].name_offset = current_offset;
-		memcpy(new_heap + current_offset, child, len + 1);
-		current_offset += len + 1;
-		dst++;
-	}
-	rcu_assign_pointer(parent->children, new_array);
-	ksu_nomount_child_array_put(old_array);
+	smp_store_release(&entry->flags, flags | KSU_NOMOUNT_CHILD_DELETED);
+	WRITE_ONCE(old_array->live_children, live_children - 1);
 	return 0;
 }
 
@@ -1195,6 +1421,8 @@ static int ksu_nomount_collect_ancestors(const struct path *backend,
 			private->ino = inode->i_ino;
 			private->dev = inode->i_sb->s_dev;
 			private->len = strlen(path);
+			private->hash = ksu_nomount_hash_path_len(path,
+								   private->len);
 			private->path = kstrdup(path, GFP_KERNEL);
 			if (!private->path) {
 				path_put(&resolved);
@@ -1202,6 +1430,7 @@ static int ksu_nomount_collect_ancestors(const struct path *backend,
 				goto out_path;
 			}
 			INIT_LIST_HEAD(&private->node);
+			INIT_HLIST_NODE(&private->hash_node);
 			private_count++;
 			rule->private_count = private_count;
 		}
@@ -1277,6 +1506,9 @@ ksu_nomount_alloc_rule(const char *virtual_path, const char *real_path,
 	rule->real_len = real_len;
 	rule->basename_len = strlen(name);
 	rule->hash = ksu_nomount_hash_path_len(virtual_path, virtual_len);
+	if (real_len)
+		rule->real_hash = ksu_nomount_hash_path_len(real_path,
+							    real_len);
 	rule->basename_hash = ksu_nomount_hash_path_len(
 		name, rule->basename_len);
 	rule->flags = flags;
@@ -1531,11 +1763,15 @@ ksu_nomount_find_parent_child_rule_locked(
 	const struct ksu_nomount_rule *exclude)
 {
 	struct ksu_nomount_rule *existing;
-	int bucket;
+	size_t name_len = strlen(name);
+	u32 hash = ksu_nomount_hash_path_len(name, name_len);
 
-	hash_for_each(ksu_nomount_rules, bucket, existing, path_node) {
+	hash_for_each_possible(ksu_nomount_basenames, existing, basename_node,
+			       hash) {
 		if (existing != exclude && existing->parent == parent &&
-		    !strcmp(existing->name, name))
+		    existing->basename_hash == hash &&
+		    existing->basename_len == name_len &&
+		    !memcmp(existing->name, name, name_len))
 			return existing;
 	}
 	return NULL;
@@ -1617,7 +1853,7 @@ static void ksu_nomount_drop_empty_parent_locked(
 		return;
 	children = rcu_dereference_protected(
 		parent->children, lockdep_is_held(&ksu_nomount_lock));
-	if (children && children->num_children)
+	if (children && READ_ONCE(children->live_children))
 		return;
 	hash_del_rcu(&parent->path_node);
 	if (parent->inode_hashed) {
@@ -1635,12 +1871,19 @@ static void ksu_nomount_link_rule_locked(struct ksu_nomount_rule *rule)
 	hash_add_rcu(ksu_nomount_rules, &rule->path_node, rule->hash);
 	hash_add_rcu(ksu_nomount_basenames, &rule->basename_node,
 		     rule->basename_hash);
-	if (!(rule->flags & KSU_NOMOUNT_FLAG_WHITEOUT))
+	if (!(rule->flags & KSU_NOMOUNT_FLAG_WHITEOUT)) {
 		hash_add_rcu(ksu_nomount_real_inodes, &rule->real_node,
 			     rule->real_ino);
+		hash_add_rcu(ksu_nomount_real_paths, &rule->real_path_node,
+			     rule->real_hash);
+	}
 	for (i = 0; i < rule->private_count; i++)
 		list_add_tail_rcu(&rule->private_paths[i].node,
 				  &ksu_nomount_private_paths);
+	for (i = 0; i < rule->private_count; i++)
+		hash_add_rcu(ksu_nomount_private_paths_hash,
+			     &rule->private_paths[i].hash_node,
+			     rule->private_paths[i].hash);
 }
 
 static void ksu_nomount_unlink_rule_locked(struct ksu_nomount_rule *rule)
@@ -1652,9 +1895,13 @@ static void ksu_nomount_unlink_rule_locked(struct ksu_nomount_rule *rule)
 		hash_del_rcu(&rule->basename_node);
 	if (!hlist_unhashed(&rule->real_node))
 		hash_del_rcu(&rule->real_node);
+	if (!hlist_unhashed(&rule->real_path_node))
+		hash_del_rcu(&rule->real_path_node);
 	for (i = 0; i < rule->private_count; i++) {
 		if (!list_empty(&rule->private_paths[i].node))
 			list_del_rcu(&rule->private_paths[i].node);
+		if (!hlist_unhashed(&rule->private_paths[i].hash_node))
+			hash_del_rcu(&rule->private_paths[i].hash_node);
 	}
 }
 
@@ -1730,7 +1977,8 @@ static int ksu_nomount_publish_rule_locked(
 	} else {
 		err = 0;
 	}
-	err = ksu_nomount_replace_child_array_locked(parent, rule);
+	err = ksu_nomount_replace_child_array_locked(
+		parent, rule, shared_child ?: victim);
 	if (err)
 		goto out_drop_parent;
 	parent_identity_changed = false;
@@ -1768,7 +2016,7 @@ static int ksu_nomount_remove_rule_locked(
 		ksu_nomount_find_parent_child_rule_locked(rule->parent,
 							 rule->name, rule);
 	int err = shared_child ? 0 :
-		ksu_nomount_delete_child_locked(rule->parent, rule->name);
+		ksu_nomount_delete_child_locked(rule->parent, rule);
 
 	if (err)
 		return err;
@@ -1778,6 +2026,41 @@ static int ksu_nomount_remove_rule_locked(
 	list_add_tail(&rule->gc_node, rule_victims);
 	ksu_nomount_drop_empty_parent_locked(rule->parent, parent_victims);
 	return 0;
+}
+
+static void ksu_nomount_prune_internal_ancestors_locked(
+	const char *start_path, struct list_head *rule_victims,
+	struct list_head *parent_victims);
+
+static int ksu_nomount_del_normalized_locked(
+	const char *normalized, const char *parent_path,
+	struct list_head *rule_victims, struct list_head *parent_victims,
+	bool prune_parent)
+{
+	struct ksu_nomount_rule *rule;
+	u32 old_flags;
+	int err;
+
+	rule = ksu_nomount_find_rule_locked(normalized);
+	if (!rule || (rule->flags & KSU_NOMOUNT_FLAG_INTERNAL))
+		return -ENOENT;
+	if (rule->d_type == DT_DIR &&
+	    ksu_nomount_path_has_children_locked(normalized)) {
+		old_flags = rule->flags;
+		WRITE_ONCE(rule->flags,
+			   old_flags | KSU_NOMOUNT_FLAG_INTERNAL |
+				       KSU_NOMOUNT_FLAG_IS_DIR);
+		err = ksu_nomount_update_parent_identity_locked(normalized, rule);
+		if (err)
+			WRITE_ONCE(rule->flags, old_flags);
+		return err;
+	}
+	err = ksu_nomount_remove_rule_locked(
+		rule, rule_victims, parent_victims);
+	if (!err && prune_parent)
+		ksu_nomount_prune_internal_ancestors_locked(
+			parent_path, rule_victims, parent_victims);
+	return err;
 }
 
 static void ksu_nomount_prune_internal_ancestors_locked(
@@ -2196,8 +2479,6 @@ int ksu_nomount_del_rule(const char *virtual_path)
 	char *normalized = __getname();
 	char *parent_path = __getname();
 	const char *unused_name;
-	struct ksu_nomount_rule *rule;
-	u32 old_flags;
 	LIST_HEAD(rule_victims);
 	LIST_HEAD(parent_victims);
 	int err;
@@ -2216,31 +2497,8 @@ int ksu_nomount_del_rule(const char *virtual_path)
 		goto out;
 
 	mutex_lock(&ksu_nomount_lock);
-	rule = ksu_nomount_find_rule_locked(normalized);
-	if (!rule || (rule->flags & KSU_NOMOUNT_FLAG_INTERNAL)) {
-		err = -ENOENT;
-		goto unlock;
-	}
-	if (ksu_nomount_path_has_children_locked(normalized)) {
-		if (rule->d_type != DT_DIR) {
-			err = -ENOTDIR;
-			goto unlock;
-		}
-		old_flags = rule->flags;
-		WRITE_ONCE(rule->flags,
-			   old_flags | KSU_NOMOUNT_FLAG_INTERNAL |
-				       KSU_NOMOUNT_FLAG_IS_DIR);
-		err = ksu_nomount_update_parent_identity_locked(normalized, rule);
-		if (err)
-			WRITE_ONCE(rule->flags, old_flags);
-	} else {
-		err = ksu_nomount_remove_rule_locked(
-			rule, &rule_victims, &parent_victims);
-		if (!err)
-			ksu_nomount_prune_internal_ancestors_locked(
-				parent_path, &rule_victims, &parent_victims);
-	}
-unlock:
+	err = ksu_nomount_del_normalized_locked(
+		normalized, parent_path, &rule_victims, &parent_victims, true);
 	mutex_unlock(&ksu_nomount_lock);
 	ksu_nomount_release_victims(&rule_victims, &parent_victims);
 out:
@@ -2249,6 +2507,112 @@ out:
 	if (parent_path)
 		__putname(parent_path);
 	return err;
+}
+
+static bool ksu_nomount_del_batch_common_parent(char **virtual_paths,
+						unsigned int count,
+						char *common_parent)
+{
+	char *normalized = __getname();
+	char *parent_path = __getname();
+	const char *unused_name;
+	unsigned int i;
+	bool common = true;
+
+	if (!normalized || !parent_path || !count) {
+		common = false;
+		goto out;
+	}
+	for (i = 0; i < count; i++) {
+		if (ksu_nomount_normalize_path(normalized,
+					       KSU_NOMOUNT_MAX_PATH,
+					       virtual_paths[i]) ||
+		    ksu_nomount_split_path(normalized, parent_path,
+					   KSU_NOMOUNT_MAX_PATH,
+					   &unused_name)) {
+			common = false;
+			break;
+		}
+		if (!i) {
+			if (strscpy(common_parent, parent_path,
+				    KSU_NOMOUNT_MAX_PATH) < 0) {
+				common = false;
+				break;
+			}
+		} else if (strcmp(common_parent, parent_path)) {
+			common = false;
+			break;
+		}
+	}
+out:
+	if (normalized)
+		__putname(normalized);
+	if (parent_path)
+		__putname(parent_path);
+	return common;
+}
+
+int ksu_nomount_del_rules(char **virtual_paths, unsigned int count)
+{
+	char *common_parent = __getname();
+	char *normalized = __getname();
+	char *parent_path = __getname();
+	const char *unused_name;
+	LIST_HEAD(rule_victims);
+	LIST_HEAD(parent_victims);
+	unsigned int i;
+	bool deleted = false;
+	int first_err = 0;
+
+	if (!count)
+		goto out;
+	if (!common_parent || !normalized || !parent_path ||
+	    !ksu_nomount_del_batch_common_parent(virtual_paths, count,
+						 common_parent)) {
+		for (i = 0; i < count; i++) {
+			int err = ksu_nomount_del_rule(virtual_paths[i]);
+
+			if (err && !first_err)
+				first_err = err;
+		}
+		goto out;
+	}
+
+	mutex_lock(&ksu_nomount_lock);
+	for (i = 0; i < count; i++) {
+		int err;
+
+		err = ksu_nomount_normalize_path(normalized,
+						 KSU_NOMOUNT_MAX_PATH,
+						 virtual_paths[i]);
+		if (!err)
+			err = ksu_nomount_split_path(normalized, parent_path,
+						     KSU_NOMOUNT_MAX_PATH,
+						     &unused_name);
+		if (!err)
+			err = ksu_nomount_del_normalized_locked(
+				normalized, parent_path, &rule_victims,
+				&parent_victims, false);
+		if (err) {
+			if (!first_err)
+				first_err = err;
+		} else {
+			deleted = true;
+		}
+	}
+	if (deleted)
+		ksu_nomount_prune_internal_ancestors_locked(
+			common_parent, &rule_victims, &parent_victims);
+	mutex_unlock(&ksu_nomount_lock);
+	ksu_nomount_release_victims(&rule_victims, &parent_victims);
+out:
+	if (common_parent)
+		__putname(common_parent);
+	if (normalized)
+		__putname(normalized);
+	if (parent_path)
+		__putname(parent_path);
+	return first_err;
 }
 
 void ksu_nomount_clear_all(void)
@@ -2702,25 +3066,41 @@ ksu_nomount_get_children_for_inode(struct inode *inode, bool *internal,
 	return children;
 }
 
-static bool ksu_nomount_children_match(
-	const struct ksu_nomount_child_array *children, const char *name,
-	int namelen)
+static bool ksu_nomount_parent_has_child_rcu(unsigned long parent_ino,
+					     dev_t parent_dev,
+					     const char *name, int namelen)
 {
-	u32 i;
+	struct ksu_nomount_rule *rule;
+	u32 name_hash;
+	bool found = false;
 
-	for (i = 0; i < children->num_children; i++) {
-		const struct ksu_nomount_child *entry = &children->entries[i];
-		const char *child = ksu_nomount_child_name(
-			children, entry);
-		size_t child_len = strlen(child);
+	if (namelen < 0 || namelen > U16_MAX)
+		return false;
+	name_hash = ksu_nomount_hash_path_len(name, namelen);
 
-		if (entry->flags & KSU_NOMOUNT_CHILD_NATIVE)
+	rcu_read_lock();
+	hash_for_each_possible_rcu(ksu_nomount_basenames, rule, basename_node,
+				   name_hash) {
+		struct ksu_nomount_parent *parent;
+
+		if (READ_ONCE(rule->basename_hash) != name_hash ||
+		    READ_ONCE(rule->basename_len) != (u16)namelen)
 			continue;
-		if (namelen >= 0 && child_len == (size_t)namelen &&
-		    !memcmp(child, name, child_len))
-			return true;
+		if (READ_ONCE(rule->visible_exists))
+			continue;
+		parent = READ_ONCE(rule->parent);
+		if (!parent ||
+		    READ_ONCE(parent->ino) != parent_ino ||
+		    READ_ONCE(parent->dev) != parent_dev)
+			continue;
+		if (!memcmp(rule->name, name, namelen)) {
+			found = true;
+			break;
+		}
 	}
-	return false;
+	rcu_read_unlock();
+
+	return found;
 }
 
 static KSU_SUSFS_ACTOR_RET ksu_nomount_iter_actor(
@@ -2731,7 +3111,8 @@ static KSU_SUSFS_ACTOR_RET ksu_nomount_iter_actor(
 		container_of(ctx, struct ksu_nomount_iter_ctx, ctx);
 	KSU_SUSFS_ACTOR_RET ret;
 
-	if (ksu_nomount_children_match(proxy->children, name, namelen))
+	if (ksu_nomount_parent_has_child_rcu(proxy->parent_ino,
+					     proxy->parent_dev, name, namelen))
 		return KSU_SUSFS_ACTOR_CONTINUE;
 	if (namelen == 1 && name[0] == '.')
 		ino = proxy->visible_ino;
@@ -2764,26 +3145,34 @@ static void ksu_nomount_emit_children_array(
 	loff_t magic = ksu_nomount_magic_pos();
 	unsigned long start = 0;
 	u32 i;
+	u32 limit = ksu_nomount_child_count(children);
 
 	if (ctx->pos >= magic &&
 	    ctx->pos < magic + KSU_NOMOUNT_MAGIC_WINDOW)
 		start = ctx->pos - magic;
 	else
 		ctx->pos = magic;
-	for (i = start; i < children->num_children; i++) {
+	for (i = start; i < limit; i++) {
 		const struct ksu_nomount_child *child = &children->entries[i];
-		const char *name = ksu_nomount_child_name(children, child);
+		const char *name;
+		u16 child_len;
+		u8 flags = ksu_nomount_child_flags_rcu(child);
 
-		if (child->flags & KSU_NOMOUNT_CHILD_NATIVE) {
+		if (flags & KSU_NOMOUNT_CHILD_DELETED) {
 			ctx->pos = magic + i + 1;
 			continue;
 		}
-		if (child->flags & KSU_NOMOUNT_FLAG_WHITEOUT) {
+		if (flags & KSU_NOMOUNT_CHILD_NATIVE) {
 			ctx->pos = magic + i + 1;
 			continue;
 		}
-		if (!dir_emit(ctx, name, strlen(name), child->ino,
-			      child->d_type))
+		if (flags & KSU_NOMOUNT_FLAG_WHITEOUT) {
+			ctx->pos = magic + i + 1;
+			continue;
+		}
+		child_len = READ_ONCE(child->name_len);
+		name = ksu_nomount_child_name(children, child);
+		if (!dir_emit(ctx, name, child_len, child->ino, child->d_type))
 			break;
 		ctx->pos = magic + i + 1;
 	}
@@ -2811,6 +3200,7 @@ int ksu_nomount_handle_iterate_dir(struct file *file,
 {
 	struct ksu_nomount_child_array *children;
 	struct ksu_nomount_iter_ctx proxy;
+	struct inode *inode = file_inode(file);
 	bool internal = false;
 	unsigned long visible_ino = 0;
 	unsigned long parent_visible_ino = 0;
@@ -2819,7 +3209,7 @@ int ksu_nomount_handle_iterate_dir(struct file *file,
 	int ret;
 
 	children = ksu_nomount_get_children_for_inode(
-		file_inode(file), &internal, &visible_ino, &parent_visible_ino);
+		inode, &internal, &visible_ino, &parent_visible_ino);
 	if (!children)
 		return ksu_nomount_call_real_iterate(file, ctx);
 	if (internal) {
@@ -2844,8 +3234,10 @@ int ksu_nomount_handle_iterate_dir(struct file *file,
 	proxy.ctx.pos = ctx->pos;
 	proxy.orig_ctx = ctx;
 	proxy.children = children;
+	proxy.parent_ino = inode->i_ino;
 	proxy.visible_ino = visible_ino;
 	proxy.parent_visible_ino = parent_visible_ino;
+	proxy.parent_dev = inode->i_sb->s_dev;
 	ret = ksu_nomount_call_real_iterate(file, &proxy.ctx);
 	ctx->pos = proxy.ctx.pos;
 	if (ret >= 0 && (ctx->pos == old_pos || ctx->pos >= magic))
@@ -3164,7 +3556,9 @@ void ksu_nomount_init(void)
 
 	hash_init(ksu_nomount_rules);
 	hash_init(ksu_nomount_real_inodes);
+	hash_init(ksu_nomount_real_paths);
 	hash_init(ksu_nomount_basenames);
+	hash_init(ksu_nomount_private_paths_hash);
 	hash_init(ksu_nomount_parents);
 	hash_init(ksu_nomount_parent_inodes);
 	hash_init(ksu_nomount_uids);

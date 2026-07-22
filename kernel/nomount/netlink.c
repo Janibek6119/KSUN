@@ -125,12 +125,35 @@ static int ksu_nomount_validate_del_payload(const char *data, int len)
 	return 0;
 }
 
+static int ksu_nomount_count_del_payload(const char *data, int len)
+{
+	int pos = 0;
+	int count = 0;
+
+	while (pos < len) {
+		u16 virtual_len;
+
+		virtual_len = get_unaligned((const u16 *)(data + pos));
+		pos += 2 + virtual_len;
+		count++;
+	}
+	return count;
+}
+
+static void ksu_nomount_free_path_array(char **paths, unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		kfree(paths[i]);
+	kfree(paths);
+}
+
 static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
 				     struct genl_info *info)
 {
 	struct nlattr *payload = info->attrs[KSU_NOMOUNT_ATTR_PAYLOAD];
 	int first_err = 0;
-	int success = 0;
 
 	if (payload) {
 		const char *data = nla_data(payload);
@@ -171,9 +194,7 @@ static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
 			if (!err)
 				err = ksu_nomount_add_rule(virtual_path, real_path,
 							   flags);
-			if (!err)
-				success++;
-			else if (!first_err)
+			if (err && !first_err)
 				first_err = err;
 
 			kfree(virtual_path);
@@ -183,7 +204,7 @@ static int ksu_nomount_genl_add_rule(struct sk_buff *skb,
 		if (pos != len)
 			return first_err ?: -EINVAL;
 
-		return success ? 0 : (first_err ?: -EINVAL);
+		return first_err ?: 0;
 	}
 
 	if (info->attrs[KSU_NOMOUNT_ATTR_VIRTUAL_PATH]) {
@@ -211,17 +232,25 @@ static int ksu_nomount_genl_del_rule(struct sk_buff *skb,
 {
 	struct nlattr *payload = info->attrs[KSU_NOMOUNT_ATTR_PAYLOAD];
 	int first_err = 0;
-	int success = 0;
 
 	if (payload) {
 		const char *data = nla_data(payload);
 		int len = nla_len(payload);
 		int pos = 0;
 		int validate_err;
+		char **paths;
+		int path_count;
+		unsigned int idx = 0;
 
 		validate_err = ksu_nomount_validate_del_payload(data, len);
 		if (validate_err)
 			return validate_err;
+		path_count = ksu_nomount_count_del_payload(data, len);
+		if (path_count <= 0)
+			return -EINVAL;
+		paths = kcalloc(path_count, sizeof(*paths), GFP_KERNEL);
+		if (!paths)
+			return -ENOMEM;
 
 		while (pos + 2 <= len) {
 			char *virtual_path = NULL;
@@ -236,18 +265,27 @@ static int ksu_nomount_genl_del_rule(struct sk_buff *skb,
 			err = ksu_nomount_copy_payload_path(data + pos, virtual_len,
 							    &virtual_path);
 			pos += virtual_len;
-			if (!err)
-				err = ksu_nomount_del_rule(virtual_path);
-			if (!err)
-				success++;
-			else if (!first_err)
+			if (!err) {
+				paths[idx++] = virtual_path;
+				virtual_path = NULL;
+			}
+			if (err && !first_err)
 				first_err = err;
 			kfree(virtual_path);
+			if (err)
+				break;
 		}
-		if (pos != len)
-			return first_err ?: -EINVAL;
+		if (!first_err && pos != len)
+			first_err = -EINVAL;
+		if (idx) {
+			int err = ksu_nomount_del_rules(paths, idx);
 
-		return success ? 0 : (first_err ?: -EINVAL);
+			if (err && !first_err)
+				first_err = err;
+		}
+		ksu_nomount_free_path_array(paths, idx);
+
+		return first_err ?: 0;
 	}
 
 	if (info->attrs[KSU_NOMOUNT_ATTR_VIRTUAL_PATH])

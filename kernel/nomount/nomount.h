@@ -71,6 +71,7 @@ void ksu_nomount_exit(void);
 int ksu_nomount_add_rule(const char *virtual_path, const char *real_path,
 			 u32 flags);
 int ksu_nomount_del_rule(const char *virtual_path);
+int ksu_nomount_del_rules(char **virtual_paths, unsigned int count);
 void ksu_nomount_clear_all(void);
 int ksu_nomount_add_uid(uid_t uid);
 int ksu_nomount_del_uid(uid_t uid);
