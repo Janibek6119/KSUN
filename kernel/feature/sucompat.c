@@ -220,16 +220,25 @@ do_orig_stat:
 }
 
 #ifdef CONFIG_KSU_HACK_ARM64_BRANCH_LINK
-static bool ksu_redirect_su_path(const char __user **filename_user, char event)
+static bool ksu_redirect_su_path(const char __user **filename_user, char event,
+				 const struct cred **old_cred_out)
 {
 	const char __user *new_filename;
 	const struct cred *old_cred;
 	bool exists;
 
+	if (!old_cred_out) {
+		pr_err("sucompat: redirect called without old_cred_out\n");
+		return false;
+	}
+	*old_cred_out = NULL;
+
 	if (unlikely(!ksu_su_compat_enabled))
 		return false;
-	if (!filename_user)
+	if (!filename_user) {
+		pr_err("sucompat: redirect called without filename_user\n");
 		return false;
+	}
 
 	if (likely(!ksu_sucompat_user_path_matches(*filename_user)))
 		return false;
@@ -238,48 +247,69 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 
 	old_cred = override_creds(ksu_cred);
 	exists = is_ksud_exists();
-	revert_creds(old_cred);
-	if (!exists)
+	if (!exists) {
+		revert_creds(old_cred);
 		return false;
+	}
 
 	new_filename = ksud_user_path();
-	if (!new_filename)
+	if (!new_filename) {
+		revert_creds(old_cred);
 		return false;
+	}
 
 	ksu_compat_sulog(event);
 	*filename_user = new_filename;
+	*old_cred_out = old_cred;
 	return true;
 }
 
-void ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-			  int *mode, int *flags)
+bool ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+			  int *mode, int *flags,
+			  const struct cred **old_cred_out)
 {
 	(void)dfd;
 	(void)mode;
 	(void)flags;
 
-	if (ksu_redirect_su_path(filename_user, 'a'))
+	if (ksu_redirect_su_path(filename_user, 'a', old_cred_out)) {
 		pr_info("faccessat su->ksud!\n");
+		return true;
+	}
+	return false;
 }
 
-void ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+bool ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags,
+		     const struct cred **old_cred_out)
 {
 	(void)dfd;
 	(void)flags;
 
-	if (ksu_redirect_su_path(filename_user, 's'))
+	if (ksu_redirect_su_path(filename_user, 's', old_cred_out)) {
 		pr_info("newfstatat su->ksud!\n");
+		return true;
+	}
+	return false;
 }
 
-bool ksu_handle_stat_kernel_filename(char *filename)
+bool ksu_handle_stat_kernel_filename(char *filename,
+				     const struct cred **old_cred_out)
 {
 	const struct cred *old_cred;
 	bool exists;
 
+	if (!old_cred_out) {
+		pr_err("sucompat: stat_kernel_filename called without old_cred_out\n");
+		return false;
+	}
+	*old_cred_out = NULL;
+
 	if (unlikely(!ksu_su_compat_enabled))
 		return false;
-	if (!filename)
+	if (!filename) {
+		pr_err("sucompat: stat_kernel_filename called without filename\n");
 		return false;
+	}
 	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
 		return false;
 	if (!ksu_sucompat_current_allowed())
@@ -287,15 +317,19 @@ bool ksu_handle_stat_kernel_filename(char *filename)
 
 	old_cred = override_creds(ksu_cred);
 	exists = is_ksud_exists();
-	revert_creds(old_cred);
-	if (!exists)
+	if (!exists) {
+		revert_creds(old_cred);
 		return false;
+	}
 
-	if (sizeof(KSUD_PATH) > sizeof(SU_PATH))
+	if (sizeof(KSUD_PATH) > sizeof(SU_PATH)) {
+		revert_creds(old_cred);
 		return false;
+	}
 	ksu_compat_sulog('s');
 	memcpy(filename, KSUD_PATH, sizeof(KSUD_PATH));
 	pr_info("stat filename su->ksud!\n");
+	*old_cred_out = old_cred;
 	return true;
 }
 #endif
