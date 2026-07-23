@@ -27,8 +27,9 @@ ifeq ($(shell grep -q "ksys_unshare" \
 	$(srctree)/include/linux/syscalls.h 2>/dev/null; echo $$?),0)
 ccflags-y += -DKSU_HAS_KSYS_UNSHARE
 endif
-ifeq ($(shell grep -Fq "extern int close_fd" \
-	$(srctree)/include/linux/fdtable.h 2>/dev/null; echo $$?),0)
+ifeq ($(shell grep -E 'extern[[:space:]]+int[[:space:]]+close_fd' \
+	$(srctree)/include/linux/fdtable.h 2>/dev/null | \
+	grep -Fvq 'close_fd_get_file'; echo $$?),0)
 ccflags-y += -DKSU_HAS_CLOSE_FD
 endif
 
