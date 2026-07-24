@@ -188,6 +188,8 @@ int __init kernelsu_init(void)
 		ksu_observer_init();
 		ksu_file_wrapper_init();
 
+		// lateload is done by ksud, so surely it's available
+		ksu_ksud_available = true;
 		ksu_boot_completed = true;
 		track_throne(false);
 

@@ -31,6 +31,7 @@
 #include "policy/feature.h"
 #include "klog.h" // IWYU pragma: keep
 #include "runtime/ksud.h"
+#include "runtime/ksud_boot.h"
 #include "feature/sucompat.h"
 #include "policy/app_profile.h"
 #include "selinux/selinux.h"
@@ -223,8 +224,6 @@ do_orig_stat:
 static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 {
 	const char __user *new_filename;
-	const struct cred *old_cred;
-	bool exists;
 
 	if (unlikely(!ksu_su_compat_enabled))
 		return false;
@@ -236,10 +235,7 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 	if (!ksu_sucompat_current_allowed())
 		return false;
 
-	old_cred = override_creds(ksu_cred);
-	exists = is_ksud_exists();
-	revert_creds(old_cred);
-	if (!exists)
+	if (unlikely(!ksu_ksud_available))
 		return false;
 
 	new_filename = ksud_user_path();
@@ -251,31 +247,34 @@ static bool ksu_redirect_su_path(const char __user **filename_user, char event)
 	return true;
 }
 
-void ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+bool ksu_handle_faccessat(int *dfd, const char __user **filename_user,
 			  int *mode, int *flags)
 {
 	(void)dfd;
 	(void)mode;
 	(void)flags;
 
-	if (ksu_redirect_su_path(filename_user, 'a'))
+	if (ksu_redirect_su_path(filename_user, 'a')) {
 		pr_info("faccessat su->ksud!\n");
+		return true;
+	}
+	return false;
 }
 
-void ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+bool ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 {
 	(void)dfd;
 	(void)flags;
 
-	if (ksu_redirect_su_path(filename_user, 's'))
+	if (ksu_redirect_su_path(filename_user, 's')) {
 		pr_info("newfstatat su->ksud!\n");
+		return true;
+	}
+	return false;
 }
 
 bool ksu_handle_stat_kernel_filename(char *filename)
 {
-	const struct cred *old_cred;
-	bool exists;
-
 	if (unlikely(!ksu_su_compat_enabled))
 		return false;
 	if (!filename)
@@ -285,10 +284,7 @@ bool ksu_handle_stat_kernel_filename(char *filename)
 	if (!ksu_sucompat_current_allowed())
 		return false;
 
-	old_cred = override_creds(ksu_cred);
-	exists = is_ksud_exists();
-	revert_creds(old_cred);
-	if (!exists)
+	if (unlikely(!ksu_ksud_available))
 		return false;
 
 	if (sizeof(KSUD_PATH) > sizeof(SU_PATH))

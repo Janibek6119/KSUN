@@ -16,6 +16,7 @@
 
 bool ksu_module_mounted __read_mostly = false;
 bool ksu_boot_completed __read_mostly = false;
+bool ksu_ksud_available __read_mostly = false;
 
 extern void ksu_avc_spoof_late_init(void);
 
@@ -30,6 +31,8 @@ void on_post_fs_data(void)
 
     done = true;
     pr_info("on_post_fs_data!\n");
+
+    ksu_ksud_available = true;
 
     ksu_load_allow_list();
     ksu_observer_init();
